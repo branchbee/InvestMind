@@ -36,6 +36,25 @@ class Settings:
     decision_weight_capital: float = float(os.getenv("DECISION_WEIGHT_CAPITAL", "0.20"))
     decision_weight_technical: float = float(os.getenv("DECISION_WEIGHT_TECHNICAL", "0.15"))
 
+    # 美股研究：全市场板块扫描（与 A 股链路对称，不使用观察池）
+    us_top_sectors: int = int(os.getenv("US_TOP_SECTORS", "10"))
+    us_top_stocks: int = int(os.getenv("US_TOP_STOCKS", "30"))
+    us_min_amount_usd: float = float(os.getenv("US_MIN_AMOUNT_USD", "10000000"))
+    # 美股 OTC（粉单）等标的通常无基础行情权限，混入快照批次会导致整批失败。
+    # 默认从全市场静态信息中剔除；关闭后仍由批次容错自动隔离坏代码。
+    us_exclude_otc: bool = os.getenv("US_EXCLUDE_OTC", "true").lower() == "true"
+    # 快照单批代码数（富途上限 400）；调小可降低单批受坏标的影响的范围
+    us_snapshot_batch_size: int = int(os.getenv("US_SNAPSHOT_BATCH_SIZE", "400"))
+
+    # 调试日志：LOG_LEVEL=DEBUG 可打开 Futu 每次调用、阶段耗时与完整堆栈
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    log_file: str = os.getenv("LOG_FILE", "output/logs/investmind.log")
+    log_console_level: str = os.getenv("LOG_CONSOLE_LEVEL", "INFO")
+    log_gui_level: str = os.getenv("LOG_GUI_LEVEL", "INFO")
+    log_third_party_level: str = os.getenv("LOG_THIRD_PARTY_LEVEL", "WARNING")
+    log_max_bytes: int = int(os.getenv("LOG_MAX_BYTES", "5242880"))
+    log_backup_count: int = int(os.getenv("LOG_BACKUP_COUNT", "3"))
+
     def decision_weights(self) -> dict:
         return {
             "财务": self.decision_weight_financial,

@@ -174,7 +174,103 @@ python -m tests.test_agents
 python -m tests.test_trading_agents
 ```
 
-## 九、打包为 Windows 可执行程序
+## 九、多市场研究（市场下拉框切换 A股 / 美股）
+
+主窗口顶部提供「市场」下拉框，在 **A股（沪深）** 与 **美股（全市场）** 之间切换。两个市场**共用同一套界面**：强势板块表格、指标卡、候选个股表格、深度研究按钮与结果弹窗完全一致，不设独立美股 Tab，也没有观察池输入框。
+
+### 使用流程
+
+1. 启动 Futu OpenD 并登录对应市场的行情权限账号（A股或美股，美股需含**板块数据**权限）。
+2. 在顶部「市场」下拉框选择目标市场；切换时自动清空上次扫描结果，避免两市场数据混淆。
+3. 点击「扫描」：两个市场走**同一条板块扫描链路**——
+   全市场快照 → 板块聚合（行业/概念板块成分股当日表现）→ 板块强度排名 → 从强势板块内选股 → 日线补充 MA5/MA20/5 日收益。
+   - 美股首次扫描会建立板块成分股缓存（受 `FUTU_MAX_PLATE_REFRESH_PER_RUN` 限流，逐步补齐）；
+   - 若账号无美股板块权限，扫描会降级为空板块并给出提示，不中断整体流程。
+4. 「强势板块」Tab 查看两个市场的板块强度排名；在「候选个股」表中选中一行（或双击）→ 点击「TradingAgents 深度研究」，弹出四层分析结果（分析师 / 研究辩论 / 交易决策 / 风险管理）。
+
+### 设计说明
+
+- **统一界面 + 下拉切换**：`gui.py` 中 `MarketScanWorker` / `TradingAnalysisWorker` 两个 Worker 通过 `market` 参数分派 A股/美股逻辑；两市场 UI 完全相同。
+- **对称的板块扫描**：美股与 A 股共用 `MarketAgent → SectorAgent → StockAgent → TechnicalAgent → ResearchAgent` 链路，仅数据源不同（`get_us_spot` / `get_sectors(market='US')`）。
+- **缓存市场隔离**：`plate_members` 表新增 `market` 列区分 A股/美股板块（旧库自动迁移），同名板块互不干扰；快照缓存用 `_spot_market` 标记避免跨市场串用。
+- **延迟导入**：LangGraph 工作流在 A股扫描时才导入，即使环境缺少该依赖，GUI 也能正常启动（美股扫描不依赖它）。
+- **代码统一**：`FutuProvider._normalise_code` 支持 `AAPL`、`US.AAPL`、`AAPL.US`、`BRK.B` 等形态；`_code6` 对美股返回完整 ticker（含层级）。A 股规则完全不变。
+- **复用四层流水线**：`USMarketOrchestrator.analyze()` 直接复用 `TradingAgentsOrchestrator`；财报 Agent 增加英文财报字段别名（Total Revenue / Net Income / Return on Equity / Gross Profit Margin）。
+- **美元计价**：成交额按「亿美元」展示；快照字段沿用 `total_amount_yuan` 名称以兼容展示层，实际口径为美元，界面已标注。
+- **美股 OTC 容错**：`get_stock_basicinfo(Market.US, STOCK)` 会返回 OTC 粉单（`US_PINK`）等标的，账号通常没有这类行情权限；而 `get_market_snapshot` 是「整批语义」——批内任一代码无权限，整批都会失败（如「暂不提供美股 OTC 市场行情」）。因此扫描前按 `exchange_type` 从源头剔除 OTC/期权/期货等标的；对残留的无权限、退市标的，快照请求在单批失败时**递归二分定位并跳过坏代码**，保留同批其余可用标的，不再让个别标的拖垮整个扫描。状态栏会显示过滤与跳过数量，A 股快照复用同一容错逻辑。
+- **缺失数据处理**：任何接口失败或字段缺失都明确标记「数据不足」，不生成虚构数值。
+
+### 配置（`.env`）
+
+```env
+US_TOP_SECTORS=10          # 美股强势板块数量
+US_TOP_STOCKS=30           # 候选个股数量
+US_MIN_AMOUNT_USD=10000000 # 美股最低成交额（美元）
+US_EXCLUDE_OTC=true        # 剔除 OTC 粉单等无行情权限标的（默认 true）
+US_SNAPSHOT_BATCH_SIZE=400 # 快照单批代码数，富途上限 400
+```
+
+### 常见问题
+
+**扫描美股时报 `get_market_snapshot 调用失败：暂不提供美股 OTC 市场行情`**：见上方「美股 OTC 容错」。默认已自动过滤并隔离这类标的；若仍失败，可把 `US_SNAPSHOT_BATCH_SIZE` 调小（如 100）以缩小单批受影响范围，或确认账号已开通美股基础行情（OTC 行情通常需单独开通）。若源头过滤误伤了个别标的，可设 `US_EXCLUDE_OTC=false`，批次容错仍会自动隔离坏代码。
+
+### 离线验证
+
+```bash
+python -m unittest discover -s tests -v  # 全量 73 项（含日志与 OTC 容错回归）
+python -m tests.test_us_market           # 美股板块扫描与数据层测试
+python -m tests.test_gui_market_switch   # 市场下拉框切换测试（Qt offscreen）
+```
+
+> 美股财务/估值/资金等接口的可用字段随 Futu SDK 版本与账号权限变化；缺失维度会在四层研究中标记「数据不足」，不会用 0 或猜测值填充。本功能仅供研究参考，不构成投资建议。
+
+## 十、调试日志
+
+程序内置统一日志：**控制台 + 滚动文件 + GUI「运行日志」面板**三路输出。文件记录最全，界面只看关键进展。
+
+### 快速开启
+
+把 `.env` 中 `LOG_LEVEL` 改为 `DEBUG` 后重启程序：
+
+```env
+LOG_LEVEL=DEBUG
+```
+
+日志默认写入 `output/logs/investmind.log`（单文件 5MB，滚动保留 3 份）。GUI 启动时会在「运行日志」面板提示路径，CLI 结束时也会打印 `调试日志: ...`。
+
+### 能排查什么
+
+- **每次 Futu 接口调用**：方法名、参数摘要、耗时、返回规模；失败时完整保留服务端错误（例如「暂不提供美股 OTC 市场行情 2578256D」）。400 个代码的批次只记录数量与首尾，不会把全表刷进日志。
+- **快照容错过程**：批次数、二分隔离坏标的、被跳过的无权限代码、OTC 源头过滤按交易所分类统计。
+- **板块缓存**：板块列表数量、缓存命中、本次刷新数量与限频、聚合结果规模；旧库 `market` 列迁移也会记录。
+- **阶段耗时**：快照 → 市场概览 → 板块聚合/排名 → 板块选股 → 技术面 → 研究解读，以及 TradingAgents 四层每一层的结论与耗时。
+- **异常堆栈**：Worker 失败、LangGraph 节点失败、板块降级都会带 `exc_info` 写入文件（界面只显示简洁告警）。
+
+文件日志格式含毫秒、级别、模块:行号与线程名，便于区分 GUI 主线程与扫描 Worker 线程。
+
+### 配置项（`.env`）
+
+```env
+LOG_LEVEL=DEBUG                # 写入文件的级别，默认 INFO
+LOG_CONSOLE_LEVEL=INFO         # 控制台级别，避免 DEBUG 刷屏
+LOG_GUI_LEVEL=INFO             # GUI「运行日志」面板级别
+LOG_THIRD_PARTY_LEVEL=WARNING  # futu / langchain / urllib3 等第三方噪音
+LOG_FILE=output/logs/investmind.log
+LOG_MAX_BYTES=5242880          # 单文件 5MB
+LOG_BACKUP_COUNT=3
+```
+
+> 日志不会记录 `LLM_API_KEY` 等敏感值；参数摘要只保留方法名、代码数量与首尾代码。GUI 面板限制 2000 行，防止 DEBUG 模式下内存无限增长。
+> 实现位于 `ashare_hunter/utils/logging.py`：`setup_logging()`（幂等）、`shutdown_logging()`（释放文件句柄）、`log_duration()` / `log_df()`（阶段耗时与数据规模）；GUI 通过 `_GuiLogBridge` 的 Qt Signal 把 Worker 线程日志安全转发到面板。
+> 离线跑测试建议设 `LLM_ENABLED=false`，否则 `ResearchAgent` 会真实请求 LLM 接口、令测试变慢（与日志无关）。
+
+### 离线验证
+
+```bash
+python -m unittest tests.test_logging -v   # 日志体系 13 项
+```
+
+## 十一、打包为 Windows 可执行程序
 
 项目提供一键打包脚本，基于 PyInstaller 将 PySide6 GUI 打包为 exe。
 

@@ -144,9 +144,20 @@ class NewsAgent:
 
     @staticmethod
     def _normalise_code(value):
-        """从 SH.600519 / 600519.SH / 600519 等形态提取 6 位 A 股代码。"""
-        match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value or ""))
-        return match.group(1) if match else ""
+        """提取证券代码主体：A 股为 6 位数字，美股为字母 ticker（如 AAPL / BRK.B）。
+
+        优先匹配 A 股 6 位数字，避免把 "US.AAPL" 中的字母误判；
+        美股形态支持 US.AAPL / AAPL.US / AAPL / BRK.B。
+        """
+        text = str(value or "").strip()
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+        if match:
+            return match.group(1)
+        # 先去掉市场前缀/后缀，再提取 ticker（BRK.B 这类多段代码需保留点号）
+        text = re.sub(r"^(US|SH|SZ|HK)\.", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\.(US|HK|SH|SZ)$", "", text, flags=re.IGNORECASE)
+        ticker = re.search(r"[A-Z][A-Z0-9]{0,5}(?:\.[A-Z]{1,2})?", text, re.IGNORECASE)
+        return ticker.group(0).upper() if ticker else ""
 
     @staticmethod
     def _is_related(item, stock_name="", stock_code=""):

@@ -9,15 +9,28 @@ from .fundamental_base import (
     fmt_pct, fmt_num,
 )
 
-# 字段别名：覆盖中英文常见口径；"归母净利润"优先于"净利润"以避免口径混淆。
+# 字段别名：覆盖中英文常见口径（含美股英文财报），"归母净利润"优先于"净利润"以避免口径混淆。
+# 注意 normalise_name 会去除空格/括号/百分号等并转小写，因此英文别名用无空格的紧凑形式。
 ALIASES = {
-    "roe": ["净资产收益率", "roe", "returnon Equity", "returnonequity", "加权净资产收益率", "净资产收益率roe"],
-    "revenue": ["营业总收入", "营业收入", "totalrevenue", "revenue", "operatingrevenue", "主营收入"],
+    "roe": [
+        "净资产收益率", "roe", "returnon Equity", "returnonequity", "加权净资产收益率",
+        "净资产收益率roe", "returnonaverageequity", "returnoncommonequity",
+        "returnoncommonstockholdersequity",
+    ],
+    "revenue": [
+        "营业总收入", "营业收入", "totalrevenue", "revenue", "operatingrevenue",
+        "主营收入", "revenues", "salesrevenuenet", "netsales", "totaloperatingrevenue",
+    ],
     "net_profit": [
         "归属于母公司股东的净利润", "归属于母公司所有者的净利润", "归母净利润",
         "netprofitattributabletoparent", "netprofit", "净利润",
+        "netincome", "netincomeloss", "netincometocommonshareholders",
+        "netincomeavailabletocommonstockholders",
     ],
-    "gross_margin": ["销售毛利率", "毛利率", "grossprofitmargin", "grossmargin", "毛利率"],
+    "gross_margin": [
+        "销售毛利率", "毛利率", "grossprofitmargin", "grossmargin",
+        "grossmarginonrevenue", "grossprofitmarginoftotalrevenue",
+    ],
 }
 
 

@@ -91,9 +91,12 @@ class LiquidityAgent:
         amount = pd.to_numeric(pd.Series([stock.get("amount")]), errors="coerce").iloc[0]
         turnover = pd.to_numeric(pd.Series([stock.get("turnover")]), errors="coerce").iloc[0]
         volume_ratio = pd.to_numeric(pd.Series([stock.get("volume_ratio")]), errors="coerce").iloc[0]
+        # A 股按亿元展示，美股按亿美元展示；单位只影响文案，不改变判定逻辑
+        currency = str(stock.get("currency") or ("USD" if str(stock.get("market", "")).upper() == "US" else "CNY")).upper()
+        amount_unit = "亿美元" if currency == "USD" else "亿元"
         parts = []
         if pd.notna(amount):
-            parts.append(f"成交额 {amount / 1e8:.2f} 亿元")
+            parts.append(f"成交额 {amount / 1e8:.2f} {amount_unit}")
         else:
             parts.append("成交额未知")
         if pd.notna(turnover):

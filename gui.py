@@ -1,21 +1,39 @@
+import logging
 import sys
+import time
 import traceback
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-    QFrame, QMessageBox, QHeaderView, QStatusBar, QDialog, QProgressDialog
+    QFrame, QMessageBox, QHeaderView, QStatusBar, QDialog, QComboBox
 )
 
-from ashare_hunter.graph.workflow import build_workflow
 from ashare_hunter.agents.stock_analysis import StockAnalysisOrchestrator
 from ashare_hunter.agents.trading_agents_orchestrator import TradingAgentsOrchestrator
 from ashare_hunter.data.futu_provider import FutuProvider
+from ashare_hunter.utils.logging import setup_logging, current_log_file
 from config import settings
+
+logger = logging.getLogger(__name__)
+
+MARKET_A = "A"
+MARKET_US = "US"
+MARKET_LABELS = {MARKET_A: "A股（沪深）", MARKET_US: "美股（全市场）"}
+
+
+class _GuiLogBridge(QObject):
+    """日志 → GUI 的线程安全桥。
+
+    Worker 线程发出的日志通过 Signal 排队到主线程，再写入 QTextEdit，
+    避免在子线程直接操作 Qt 控件。
+    """
+
+    line = Signal(str)
 
 
 def display_value(value, column=""):
@@ -32,48 +50,100 @@ def display_value(value, column=""):
     return str(value)
 
 
-class ScanWorker(QThread):
+def _make_provider():
+    """构造 FutuProvider，A 股与美股共用同一套连接参数。"""
+    return FutuProvider(
+        host=settings.futu_host,
+        port=settings.futu_port,
+        max_plate_refresh_per_run=settings.futu_max_plate_refresh_per_run,
+        plate_cache_days=settings.futu_plate_cache_days,
+        request_interval=settings.futu_request_interval,
+        us_exclude_otc=settings.us_exclude_otc,
+        snapshot_batch_size=settings.us_snapshot_batch_size,
+    )
+
+
+class MarketScanWorker(QThread):
+    """统一扫描 Worker：A 股走 LangGraph 工作流，美股走板块扫描编排器。"""
+
     completed = Signal(object)
     failed = Signal(str)
     message = Signal(str)
 
-    def run(self):
-        try:
-            self.message.emit("正在连接 Futu OpenD 并获取行情……")
-            result = build_workflow().invoke({})
-            self.completed.emit(result)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
-
-
-class StockAnalysisWorker(QThread):
-    completed = Signal(object)
-    failed = Signal(str)
-    message = Signal(str)
-
-    def __init__(self, stock, market, sectors):
+    def __init__(self, market=MARKET_A):
         super().__init__()
-        self.stock = stock
         self.market = market
-        self.sectors = sectors
 
     def run(self):
         provider = None
+        started = time.perf_counter()
+        market = "US" if self.market == MARKET_US else "A"
+        logger.info("扫描 Worker 启动：市场=%s", market)
         try:
-            self.message.emit(f"正在对 {self.stock.get('name', '')} ({self.stock.get('code', '')}) 执行 TradingAgents 四层研究……")
-            provider = FutuProvider(
-                host=settings.futu_host,
-                port=settings.futu_port,
-                max_plate_refresh_per_run=settings.futu_max_plate_refresh_per_run,
-                plate_cache_days=settings.futu_plate_cache_days,
-                request_interval=settings.futu_request_interval,
-            )
-            result = TradingAgentsOrchestrator(provider).analyze(
-                self.stock, self.market, self.sectors
-            )
+            if self.market == MARKET_US:
+                from ashare_hunter.graph.us_workflow import USMarketOrchestrator
+                provider = _make_provider()
+                result = USMarketOrchestrator(provider).scan(message=self.message.emit)
+            else:
+                # 延迟导入：避免在缺少 langgraph 依赖时 GUI 无法启动
+                self.message.emit("正在连接 Futu OpenD 并获取行情……")
+                from ashare_hunter.graph.workflow import build_workflow
+                result = build_workflow().invoke({})
+            logger.info("扫描 Worker 完成：市场=%s 耗时 %.3fs",
+                        market, time.perf_counter() - started)
             self.completed.emit(result)
         except Exception:
-            self.failed.emit(traceback.format_exc())
+            error = traceback.format_exc()
+            logger.error("扫描 Worker 失败：市场=%s 耗时 %.3fs\n%s",
+                         market, time.perf_counter() - started, error)
+            self.failed.emit(error)
+        finally:
+            if provider is not None:
+                provider.close()
+
+
+class TradingAnalysisWorker(QThread):
+    """统一四层研究 Worker：A 股 / 美股共用 TradingAgentsOrchestrator。"""
+
+    completed = Signal(object)
+    failed = Signal(str)
+    message = Signal(str)
+
+    def __init__(self, stock, market_summary, sectors, market=MARKET_A):
+        super().__init__()
+        self.stock = stock
+        self.market_summary = market_summary
+        self.sectors = sectors
+        self.market = market
+
+    def run(self):
+        provider = None
+        started = time.perf_counter()
+        name = self.stock.get('name', '')
+        code = self.stock.get('code', '')
+        market = "US" if self.market == MARKET_US else "A"
+        logger.info("四层研究 Worker 启动：%s (%s) 市场=%s", name, code, market)
+        try:
+            scope = '美股' if self.market == MARKET_US else ''
+            self.message.emit(
+                f"正在对 {name} ({code}) 执行 {scope}TradingAgents 四层研究……"
+            )
+            provider = _make_provider()
+            stock = dict(self.stock)
+            if self.market == MARKET_US:
+                stock.setdefault('market', 'US')
+                stock.setdefault('currency', 'USD')
+            result = TradingAgentsOrchestrator(provider).analyze(
+                stock, self.market_summary, self.sectors
+            )
+            logger.info("四层研究 Worker 完成：%s (%s) 耗时 %.3fs",
+                        name, code, time.perf_counter() - started)
+            self.completed.emit(result)
+        except Exception:
+            error = traceback.format_exc()
+            logger.error("四层研究 Worker 失败：%s (%s) 耗时 %.3fs\n%s",
+                         name, code, time.perf_counter() - started, error)
+            self.failed.emit(error)
         finally:
             if provider is not None:
                 provider.close()
@@ -310,21 +380,27 @@ class MetricCard(QFrame):
         layout.addWidget(self.value)
         layout.addWidget(self.hint)
 
-    def set_value(self, value, hint=""):
+    def set_value(self, value, hint=None):
         self.value.setText(str(value))
-        self.hint.setText(hint)
+        if hint is not None:
+            self.hint.setText(hint)
 
 
 class HunterWindow(QMainWindow):
+    """主窗口：通过市场下拉框在 A 股 / 美股之间切换，共用同一套界面。"""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("A-Share Hunter · A股强势板块与个股分析")
+        self.setWindowTitle("Market Hunter · 多市场板块/个股研究")
         self.resize(1420, 900)
         self.worker = None
+        self.analysis_worker = None
         self.result = None
         self._build_ui()
         self._apply_style()
+        self._on_market_changed()  # 初始化市场相关文案
 
+    # ---------- UI 构建 ----------
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -334,14 +410,23 @@ class HunterWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("A-Share Hunter")
+        title = QLabel("Market Hunter")
         title.setObjectName("mainTitle")
-        subtitle = QLabel("基于 Futu OpenD + LangGraph 的 A股强势板块 / 强势个股发现")
-        subtitle.setObjectName("subtitle")
+        self.subtitle = QLabel("基于 Futu OpenD + TradingAgents 的多市场投研系统")
+        self.subtitle.setObjectName("subtitle")
         title_box.addWidget(title)
-        title_box.addWidget(subtitle)
+        title_box.addWidget(self.subtitle)
         header.addLayout(title_box)
         header.addStretch()
+
+        header.addWidget(QLabel("市场："))
+        self.market_combo = QComboBox()
+        for market, label in MARKET_LABELS.items():
+            self.market_combo.addItem(label, market)
+        self.market_combo.setObjectName("marketCombo")
+        self.market_combo.currentIndexChanged.connect(self._on_market_changed)
+        header.addWidget(self.market_combo)
+
         self.scan_button = QPushButton("▶  开始扫描")
         self.scan_button.setObjectName("scanButton")
         self.scan_button.clicked.connect(self.start_scan)
@@ -352,7 +437,7 @@ class HunterWindow(QMainWindow):
         header.addWidget(self.analyze_button)
         root.addLayout(header)
 
-        self.status_label = QLabel("尚未扫描。请先启动 Futu OpenD 并登录具备 A股行情权限的账号。")
+        self.status_label = QLabel("尚未扫描。")
         self.status_label.setObjectName("statusLabel")
         root.addWidget(self.status_label)
 
@@ -377,6 +462,7 @@ class HunterWindow(QMainWindow):
 
         self.sector_table = self._make_table()
         self.tabs.addTab(self.sector_table, "强势板块")
+        self.sector_tab_index = self.tabs.indexOf(self.sector_table)
 
         self.stock_table = self._make_table()
         self.stock_table.cellDoubleClicked.connect(self.analyze_selected_stock)
@@ -388,6 +474,8 @@ class HunterWindow(QMainWindow):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        # DEBUG 模式下日志量较大，限制面板最大行数避免内存无限增长
+        self.log_text.document().setMaximumBlockCount(2000)
         self.tabs.addTab(self.log_text, "运行日志")
 
         self.setStatusBar(QStatusBar())
@@ -414,6 +502,7 @@ class HunterWindow(QMainWindow):
             QLabel#metricTitle { color: #667085; font-size: 12px; }
             QLabel#metricValue { color: #172033; font-size: 23px; font-weight: 700; }
             QLabel#metricHint { color: #98a2b3; font-size: 11px; }
+            QComboBox#marketCombo { background: white; border: 1px solid #d0d9e8; border-radius: 8px; padding: 8px 12px; min-width: 130px; font-weight: 600; }
             QPushButton#scanButton { background: #2457d6; color: white; border: 0; border-radius: 8px; padding: 11px 20px; font-weight: 600; }
             QPushButton#scanButton:hover { background: #1948bd; }
             QPushButton#scanButton:disabled { background: #9aabd2; }
@@ -424,16 +513,63 @@ class HunterWindow(QMainWindow):
             QHeaderView::section { background: #f2f5fa; color: #475467; border: 0; padding: 8px; font-weight: 600; }
         """)
 
+    # ---------- 市场切换 ----------
+    def current_market(self):
+        return self.market_combo.currentData()
+
+    def is_us(self):
+        return self.current_market() == MARKET_US
+
+    def _on_market_changed(self):
+        """市场切换：更新文案、清空上次结果。两个市场共用同一套界面与板块 Tab。"""
+        us = self.is_us()
+        logger.info("市场切换为 %s，清空上次扫描结果", "美股（全市场）" if us else "A股（沪深）")
+        self.subtitle.setText(
+            "美股全市场板块扫描 + TradingAgents 四层投研流水线（美元计价）" if us
+            else "基于 Futu OpenD + TradingAgents 的 A 股板块/个股发现"
+        )
+        self.scan_button.setText("▶  扫描美股全市场" if us else "▶  扫描A股全市场")
+        self.card_amount.hint.setText("美元口径汇总" if us else "按 Provider 返回字段汇总")
+        self.status_label.setText(
+            "美股模式：请启动 Futu OpenD 并登录具备美股行情与板块权限的账号。"
+            if us else
+            "A股模式：请启动 Futu OpenD 并登录具备 A股行情权限的账号。"
+        )
+        self._clear_results()
+
+    def _clear_results(self):
+        self.result = None
+        self.analyze_button.setEnabled(False)
+        for card in (self.card_regime, self.card_breadth, self.card_avg,
+                     self.card_amount, self.card_sector, self.card_stock):
+            card.set_value("—")
+        for table in (self.sector_table, self.stock_table):
+            table.setSortingEnabled(False)
+            table.clear()
+            table.setRowCount(0)
+            table.setColumnCount(0)
+            table.setSortingEnabled(True)
+        self.market_text.clear()
+        self.explanation.clear()
+
+    # ---------- 扫描 ----------
     def start_scan(self):
         self.scan_button.setEnabled(False)
-        self.status_label.setText("扫描运行中：正在连接行情服务、计算板块与个股强度……")
-        self.log_text.append("开始执行 LangGraph 扫描工作流。")
+        self.analyze_button.setEnabled(False)
+        self.status_label.setText(
+            f"{'美股全市场' if self.is_us() else 'A股全市场'}扫描运行中：正在连接行情服务并计算板块与个股强度……"
+        )
+        self.log_text.append(f"开始执行{'美股' if self.is_us() else 'A股'}全市场板块扫描。")
         self.statusBar().showMessage("扫描中……")
-        self.worker = ScanWorker()
+        self.worker = MarketScanWorker(market=self.current_market())
         self.worker.message.connect(self.on_message)
         self.worker.completed.connect(self.on_completed)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
+
+    def append_log_line(self, text):
+        """日志桥的槽：把日志追加到「运行日志」面板（由主线程执行）。"""
+        self.log_text.append(text)
 
     def on_message(self, message):
         self.status_label.setText(message)
@@ -442,6 +578,9 @@ class HunterWindow(QMainWindow):
     def on_completed(self, result):
         self.result = result
         self.scan_button.setEnabled(True)
+        us = self.is_us()
+        currency = "USD" if us else "CNY"
+        unit = "亿美元" if us else "亿"
         market = result.get("market_summary", {})
         sectors = result.get("top_sectors", pd.DataFrame())
         stocks = result.get("top_stocks", pd.DataFrame())
@@ -450,37 +589,50 @@ class HunterWindow(QMainWindow):
         if not isinstance(stocks, pd.DataFrame):
             stocks = pd.DataFrame(stocks)
 
-        self.card_regime.set_value(market.get("market_regime", "未知"), "市场宽度与平均涨跌幅综合判断")
         breadth = market.get("advance_decline_ratio")
-        self.card_breadth.set_value(f"{breadth:.1%}" if isinstance(breadth, (float, int)) else "—",
-                                    f"上涨 {market.get('up_count', 0)} / 下跌 {market.get('down_count', 0)}")
-        self.card_avg.set_value(f"{market.get('avg_change_pct', 0):.2f}%", "全市场快照平均涨跌幅")
+        self.card_regime.set_value(market.get("market_regime", "未知"), "市场宽度与平均涨跌幅综合判断")
+        self.card_breadth.set_value(
+            f"{breadth:.1%}" if isinstance(breadth, (float, int)) else "—",
+            f"上涨 {market.get('up_count', 0)} / 下跌 {market.get('down_count', 0)}",
+        )
+        self.card_avg.set_value(f"{market.get('avg_change_pct', 0):.2f}%", "快照平均涨跌幅")
         amount = market.get("total_amount_yuan", 0)
-        self.card_amount.set_value(f"{amount / 1e8:.2f} 亿", "快照成交额汇总（需核验数据字段口径）")
+        self.card_amount.set_value(f"{amount / 1e8:.2f} {unit}", "快照成交额汇总")
         self.card_sector.set_value(len(sectors), "量化评分靠前的正涨幅板块")
-        self.card_stock.set_value(len(stocks), "通过过滤并完成综合排序的候选股")
+        self.card_stock.set_value(len(stocks), "通过过滤并完成综合排序")
 
-        self._populate_table(self.sector_table, sectors)
-        self._populate_table(self.stock_table, stocks)
+        # 两个市场都展示强势板块 Tab
+        self._populate_table(self.sector_table, sectors, currency)
+        self._populate_table(self.stock_table, stocks, currency)
         self.analyze_button.setEnabled(not stocks.empty)
 
         lines = [
             f"扫描时间：{result.get('scan_time', '未知')}",
+            f"市场：{'美股（全市场，USD）' if us else 'A股（沪深，CNY）'}",
             f"市场环境：{market.get('market_regime', '未知')}",
             f"上涨 / 下跌 / 平盘：{market.get('up_count', 0)} / {market.get('down_count', 0)} / {market.get('flat_count', 0)}",
             f"上涨家数占比：{market.get('advance_decline_ratio', 0):.1%}",
             f"平均涨跌幅：{market.get('avg_change_pct', 0):.3f}%",
-            f"报告文件：{result.get('report_path', '未生成')}",
-            "",
-            "说明：板块强度由成分股聚合计算，不等同于官方板块指数涨幅。候选股得分用于排序，不代表收益概率或买卖建议。"
+            f"强势板块：{len(sectors)} 个",
         ]
-        self.market_text.setPlainText("\\n".join(lines))
+        if us:
+            lines.append(f"成交额口径：{market.get('amount_note', '美元')}")
+        else:
+            lines.append(f"报告文件：{result.get('report_path', '未生成')}")
+        lines += [
+            "",
+            "说明：板块强度由成分股快照聚合计算；候选股得分用于排序，不代表收益概率或买卖建议。"
+            "双击候选个股可进入 TradingAgents 四层深度研究。",
+        ]
+        self.market_text.setPlainText("\n".join(lines))
         self.explanation.setPlainText(result.get("explanation", "无研究解读"))
-        self.status_label.setText(f"扫描完成：{len(sectors)} 个强势板块，{len(stocks)} 只候选个股。")
-        self.log_text.append(f"扫描完成。报告：{result.get('report_path', '无')}")
+        self.status_label.setText(
+            f"{'美股' if us else 'A股'}扫描完成：{len(stocks)} 只候选个股。"
+        )
+        self.log_text.append(f"扫描完成。市场={'US' if us else 'A'}，候选 {len(stocks)} 只。")
         self.statusBar().showMessage("扫描完成")
 
-    def _populate_table(self, table, frame):
+    def _populate_table(self, table, frame, currency="CNY"):
         table.setSortingEnabled(False)
         table.clear()
         if frame is None or frame.empty:
@@ -488,33 +640,41 @@ class HunterWindow(QMainWindow):
             table.setColumnCount(0)
             table.setSortingEnabled(True)
             return
-        # Prefer useful columns first, retain remaining fields after them.
         preferred = [
             "sector_name", "name", "code", "board_type", "score", "change_pct",
             "breadth", "up_count", "down_count", "amount", "turnover",
             "volume_ratio", "sector_names", "sector_score", "return_5d_pct",
-            "ma5", "ma20", "above_ma5", "above_ma20"
+            "ma5", "ma20", "above_ma5", "above_ma20",
         ]
         cols = [c for c in preferred if c in frame.columns]
-        cols += [c for c in frame.columns if c not in cols]
+        cols += [c for c in frame.columns if c not in cols and c not in ("market", "currency")]
         table.setColumnCount(len(cols))
         table.setHorizontalHeaderLabels(cols)
         table.setRowCount(len(frame))
         for r, (_, row) in enumerate(frame[cols].iterrows()):
             for c, col in enumerate(cols):
-                item = QTableWidgetItem(display_value(row[col], col))
-                item.setTextAlignment(Qt.AlignVCenter | (Qt.AlignRight if isinstance(row[col], (int, float)) else Qt.AlignLeft))
+                if col == "amount" and currency == "USD" and isinstance(row[col], (int, float)) and pd.notna(row[col]):
+                    text = f"{float(row[col]) / 1e8:,.2f} 亿美元"
+                else:
+                    text = display_value(row[col], col)
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(
+                    Qt.AlignVCenter | (Qt.AlignRight if isinstance(row[col], (int, float)) else Qt.AlignLeft)
+                )
                 if col == "code":
                     item.setData(Qt.UserRole, str(row[col]))
                 table.setItem(r, c, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
 
-
+    # ---------- 个股深度研究 ----------
     def analyze_selected_stock(self, *args):
         row_index = self.stock_table.currentRow()
         if row_index < 0:
-            QMessageBox.information(self, "请选择股票", "请先在候选个股表格中选择一只股票。")
+            QMessageBox.information(self, "请选择股票", "请先在候选个股表格中选择一只标的。")
+            return
+        if self.result is None:
+            QMessageBox.warning(self, "无法分析", "请先执行扫描。")
             return
         code_col = -1
         for col in range(self.stock_table.columnCount()):
@@ -523,18 +683,18 @@ class HunterWindow(QMainWindow):
                 code_col = col
                 break
         if code_col < 0:
-            QMessageBox.warning(self, "无法分析", "候选股表格中没有股票代码字段。")
+            QMessageBox.warning(self, "无法分析", "候选股表格中没有代码字段。")
             return
         code_item = self.stock_table.item(row_index, code_col)
         code = code_item.data(Qt.UserRole) if code_item else None
-        if not code:
-            code = code_item.text() if code_item else ""
+        if not code and code_item:
+            code = code_item.text()
         stocks = self.result.get("top_stocks", pd.DataFrame())
         if not isinstance(stocks, pd.DataFrame):
             stocks = pd.DataFrame(stocks)
         matched = stocks[stocks["code"].astype(str) == str(code)]
         if matched.empty:
-            QMessageBox.warning(self, "无法分析", f"没有找到股票 {code} 的扫描记录。")
+            QMessageBox.warning(self, "无法分析", f"没有找到 {code} 的扫描记录。")
             return
         stock = matched.iloc[0].to_dict()
         sectors = self.result.get("top_sectors", pd.DataFrame())
@@ -542,8 +702,9 @@ class HunterWindow(QMainWindow):
             sectors = pd.DataFrame(sectors)
         self.analyze_button.setEnabled(False)
         self.status_label.setText(f"正在对 {stock.get('name', '')}（{code}）执行 TradingAgents 四层研究……")
-        self.analysis_worker = StockAnalysisWorker(
-            stock, self.result.get("market_summary", {}), sectors
+        self.analysis_worker = TradingAnalysisWorker(
+            stock, self.result.get("market_summary", {}), sectors,
+            market=self.current_market(),
         )
         self.analysis_worker.completed.connect(self.on_stock_analysis_completed)
         self.analysis_worker.failed.connect(self.on_stock_analysis_failed)
@@ -552,9 +713,10 @@ class HunterWindow(QMainWindow):
 
     def on_stock_analysis_completed(self, result):
         self.analyze_button.setEnabled(True)
-        self.status_label.setText("TradingAgents 四层研究完成。")
+        scope = "美股" if self.is_us() else ""
+        self.status_label.setText(f"{scope}TradingAgents 四层研究完成。")
         self.log_text.append(
-            f"TradingAgents 研究完成：{result.get('stock', {}).get('name', '')} "
+            f"研究完成：{result.get('stock', {}).get('name', '')} "
             f"{result.get('stock', {}).get('code', '')}"
         )
         self.analysis_dialog = StockAnalysisDialog(result, self)
@@ -562,7 +724,7 @@ class HunterWindow(QMainWindow):
 
     def on_stock_analysis_failed(self, error):
         self.analyze_button.setEnabled(True)
-        self.status_label.setText("个股多Agent分析失败，请检查行情权限和日线接口。")
+        self.status_label.setText("个股分析失败，请检查行情权限、日线接口与接口配额。")
         self.log_text.append(error)
         QMessageBox.critical(self, "个股分析失败", error[-2500:])
 
@@ -579,6 +741,18 @@ def main():
     app.setFont(QFont("Microsoft YaHei", 10))
     window = HunterWindow()
     window.show()
+
+    # 日志同时写入滚动文件并在「运行日志」面板展示；Signal 保证跨线程安全
+    bridge = _GuiLogBridge()
+    window._log_bridge = bridge  # 保持引用，避免被 GC 回收
+    bridge.line.connect(window.append_log_line)
+    setup_logging(gui_callback=bridge.line.emit)
+    log_path = current_log_file()
+    logger.info("GUI 启动完成，日志文件：%s", log_path)
+    window.log_text.append(
+        f"调试日志已开启：{log_path}；在 .env 设置 LOG_LEVEL=DEBUG 可查看每次行情调用与耗时。"
+    )
+
     sys.exit(app.exec())
 
 

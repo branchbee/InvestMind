@@ -4,11 +4,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 class StockAgent:
-    def run(self, sectors, provider, top_n=30, min_amount=50_000_000):
+    def run(self, sectors, provider, top_n=30, min_amount=50_000_000, market="SH"):
         chunks = []
         for _, s in sectors.iterrows():
             try:
-                part = provider.get_sector_stocks(str(s.sector_name), str(s.board_type))
+                part = provider.get_sector_stocks(str(s.sector_name), str(s.board_type), market=market)
                 part["sector_name"] = str(s.sector_name)
                 part["sector_score"] = float(s.score)
                 chunks.append(part)

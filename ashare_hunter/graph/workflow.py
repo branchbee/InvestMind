@@ -1,7 +1,31 @@
+import functools
+import logging
+import time
 from datetime import datetime
 from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
 from config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _timed(name, fn):
+    """LangGraph 节点包装：记录耗时、输出键与异常堆栈，不改变节点语义。"""
+    @functools.wraps(fn)
+    def wrapper(state):
+        started = time.perf_counter()
+        logger.debug("节点 %s 开始", name)
+        try:
+            out = fn(state)
+        except Exception:
+            logger.error("节点 %s 失败（耗时 %.3fs）", name,
+                         time.perf_counter() - started, exc_info=True)
+            raise
+        keys = list(out.keys()) if isinstance(out, dict) else type(out).__name__
+        logger.info("节点 %s 完成，耗时 %.3fs，输出键=%s",
+                    name, time.perf_counter() - started, keys)
+        return out
+    return wrapper
 from ashare_hunter.data.futu_provider import FutuProvider
 from ashare_hunter.agents.market_agent import MarketAgent
 from ashare_hunter.agents.sector_agent import SectorAgent
@@ -23,12 +47,15 @@ class HunterState(TypedDict, total=False):
 
 
 def build_workflow():
+    logger.info("构建 A 股 LangGraph 扫描工作流")
     provider = FutuProvider(
         host=settings.futu_host,
         port=settings.futu_port,
         max_plate_refresh_per_run=settings.futu_max_plate_refresh_per_run,
         plate_cache_days=settings.futu_plate_cache_days,
         request_interval=settings.futu_request_interval,
+        us_exclude_otc=settings.us_exclude_otc,
+        snapshot_batch_size=settings.us_snapshot_batch_size,
     )
     market_a, sector_a = MarketAgent(), SectorAgent()
     stock_a, tech_a = StockAgent(), TechnicalAgent()
@@ -81,7 +108,7 @@ def build_workflow():
         ("research_agent", research),
         ("report_agent", report),
     ]:
-        graph.add_node(name, fn)
+        graph.add_node(name, _timed(name, fn))
 
     graph.set_entry_point("collect")
     graph.add_edge("collect", "market_agent")
