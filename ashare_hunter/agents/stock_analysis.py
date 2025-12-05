@@ -7,6 +7,11 @@ import requests
 from config import settings
 from ashare_hunter.data.futu_provider import FutuProvider
 
+# A 股个股年化波动率通常落在 25%-50%，50% 以上才算显著偏高。
+# 原阈值 4% 会把绝大多数正常股票误标为高波动，已上调并集中为常量便于调整。
+TRADING_DAYS_PER_YEAR = 252
+HIGH_VOLATILITY_ANNUAL_PCT = 50.0
+
 
 class TrendAgent:
     """基于日线收盘价识别短中期趋势。"""
@@ -118,11 +123,11 @@ class RiskAgent:
             risk_flags.append("当日跌幅较大，需关注趋势破位与流动性风险")
         if len(close) >= 21:
             daily_ret = close.pct_change().dropna().tail(20)
-            vol = float(daily_ret.std() * math.sqrt(交易日年化) * 100) if len(daily_ret) >= 5 else None
+            vol = float(daily_ret.std() * math.sqrt(TRADING_DAYS_PER_YEAR) * 100) if len(daily_ret) >= 5 else None
             peak = close.tail(20).cummax()
             drawdown = float(((close.tail(20) / peak) - 1).min() * 100)
-            if vol is not None and vol >= 4:
-                risk_flags.append("近20日波动较高")
+            if vol is not None and vol >= HIGH_VOLATILITY_ANNUAL_PCT:
+                risk_flags.append(f"近20日年化波动率 {vol:.1f}%，波动较高")
             if drawdown <= -10:
                 risk_flags.append("近20日最大回撤超过 10%")
         else:
@@ -136,8 +141,6 @@ class RiskAgent:
             "risk_flags": risk_flags, "conclusion": "；".join(risk_flags)
         }
 
-
-交易日年化 = 252
 
 
 class SectorContextAgent:
@@ -192,6 +195,8 @@ class StockAnalysisOrchestrator:
     def analyze(self, stock, market=None, sectors=None):
         code = str(stock.get("code", ""))
         name = str(stock.get("name", ""))
+        # 名称缺失时退化为代码检索，避免用空关键词请求资讯接口
+        news_keyword = name or code
 
         history = self._safe_fetch("历史K线", self.provider.get_daily_history, code, days=80)
         if not isinstance(history, pd.DataFrame):
@@ -210,11 +215,11 @@ class StockAnalysisOrchestrator:
         pb_detail = self._safe_fetch("PB估值", self.provider.get_valuation_detail,
                                      code, valuation_type="PB", interval_type=settings.valuation_interval)
         notices = self._safe_fetch("公告检索", self.provider.get_news,
-                                   name, max_count=settings.news_max_count, news_sub_type="NOTICE")
+                                   news_keyword, max_count=settings.news_max_count, news_sub_type="NOTICE")
         news = self._safe_fetch("资讯检索", self.provider.get_news,
-                                name, max_count=settings.news_max_count, news_sub_type="NEWS")
+                                news_keyword, max_count=settings.news_max_count, news_sub_type="NEWS")
         ratings = self._safe_fetch("评级检索", self.provider.get_news,
-                                   name, max_count=settings.news_max_count, news_sub_type="RATING")
+                                   news_keyword, max_count=settings.news_max_count, news_sub_type="RATING")
         capital_flow = self._safe_fetch("资金流", self.provider.get_capital_flow,
                                         code, period_type="DAY", days=settings.capital_flow_days)
         distribution = self._safe_fetch("资金分布", self.provider.get_capital_distribution, code)
@@ -226,7 +231,8 @@ class StockAnalysisOrchestrator:
             snapshot=snapshot, pe_detail=pe_detail, pb_detail=pb_detail,
             profit_growth_pct=fin_agent.get("net_profit_yoy_pct"),
         )
-        news_agent = NewsAgent().run(notices=notices, news=news, ratings=ratings, stock_name=name)
+        news_agent = NewsAgent().run(notices=notices, news=news, ratings=ratings,
+                                     stock_name=name, stock_code=code)
         capital_agent = CapitalAgent().run(
             capital_flow=capital_flow, distribution=distribution,
             institutional=institutional, analyst_consensus=consensus,

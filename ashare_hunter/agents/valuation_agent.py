@@ -5,7 +5,7 @@ valuation_percentile 字段（真实计算的 0-100 分位）；PEG 由 PE-TTM �
 净利润同比增速计算，增速为负或缺失时不计算 PEG，避免指标失真。
 """
 
-from .fundamental_base import to_number, score_by_thresholds, score_label, fmt_pct
+from .fundamental_base import to_number, score_by_thresholds, score_label, fmt_pct, fmt_num
 
 # 估值分位：低于 30% 偏低，30%-70% 中性，高于 70% 偏高（方法论参考阈值）
 PERCENTILE_THRESHOLDS = [(70, 30), (30, 55), (0, 85)]
@@ -70,7 +70,8 @@ class ValuationAgent:
                     if peg is not None else "无法计算"},
         }
 
-        parts = [f"PE(TTM) {fmt_pct(pe)}", f"PB {fmt_pct(pb)}", f"PS {fmt_pct(ps)}"]
+        # PE/PB/PS 是倍数而非百分比，不能用 fmt_pct 格式化。
+        parts = [f"PE(TTM) {fmt_num(pe)}", f"PB {fmt_num(pb)}", f"PS {fmt_num(ps)}"]
         if percentile is not None:
             parts.append(f"PE 历史分位 {percentile:.1f}%（{self._percentile_label(percentile)}，近5年口径）")
         else:

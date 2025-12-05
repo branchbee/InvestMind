@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 
 from ashare_hunter.graph.workflow import build_workflow
 from ashare_hunter.agents.stock_analysis import StockAnalysisOrchestrator
+from ashare_hunter.agents.trading_agents_orchestrator import TradingAgentsOrchestrator
 from ashare_hunter.data.futu_provider import FutuProvider
 from config import settings
 
@@ -59,7 +60,7 @@ class StockAnalysisWorker(QThread):
     def run(self):
         provider = None
         try:
-            self.message.emit(f"正在分析 {self.stock.get('name', '')} ({self.stock.get('code', '')})……")
+            self.message.emit(f"正在对 {self.stock.get('name', '')} ({self.stock.get('code', '')}) 执行 TradingAgents 四层研究……")
             provider = FutuProvider(
                 host=settings.futu_host,
                 port=settings.futu_port,
@@ -67,7 +68,7 @@ class StockAnalysisWorker(QThread):
                 plate_cache_days=settings.futu_plate_cache_days,
                 request_interval=settings.futu_request_interval,
             )
-            result = StockAnalysisOrchestrator(provider).analyze(
+            result = TradingAgentsOrchestrator(provider).analyze(
                 self.stock, self.market, self.sectors
             )
             self.completed.emit(result)
@@ -79,12 +80,15 @@ class StockAnalysisWorker(QThread):
 
 
 class StockAnalysisDialog(QDialog):
+    """分层展示 TradingAgents 四层研究结果。"""
+
     def __init__(self, result, parent=None):
         super().__init__(parent)
         stock = result.get("stock", {})
-        self.setWindowTitle(f"多Agent个股分析 · {stock.get('name', '')} {stock.get('code', '')}")
-        self.resize(1000, 760)
+        self.setWindowTitle(f"TradingAgents 个股研究 · {stock.get('name', '')} {stock.get('code', '')}")
+        self.resize(1120, 840)
         layout = QVBoxLayout(self)
+
         heading = QLabel(
             f"{stock.get('name', '未知股票')}（{stock.get('code', '')}）  "
             f"当前涨跌幅：{display_value(stock.get('change_pct'), 'change_pct')}"
@@ -92,29 +96,59 @@ class StockAnalysisDialog(QDialog):
         heading.setStyleSheet("font-size: 20px; font-weight: 700; padding: 8px;")
         layout.addWidget(heading)
 
-        overall = result.get("overall", {})
-        conclusion = QLabel(f"综合结论：{overall.get('label', '待判断')}")
-        conclusion.setStyleSheet(
-            "background:#eaf1fb; color:#244b87; padding:12px; border-radius:8px; font-size:16px; font-weight:600;"
+        ta = result.get("trading_agents") or {}
+        final = ta.get("final_recommendation") or {}
+        action = final.get("action") or "待判断"
+        action_color = {"买入": "#c62828", "卖出": "#2e7d32", "持有": "#616161"}.get(action, "#244b87")
+        banner = QLabel(
+            f"最终建议：{action}　｜　研究裁决：{final.get('verdict', '—')}　｜　"
+            f"建议仓位：{final.get('position', '—')}　｜　"
+            f"风险等级：{final.get('risk_level', '—')}　｜　策略审核：{final.get('review', '—')}"
         )
-        layout.addWidget(conclusion)
-
-        score_text = "—"
-        if overall.get("score") is not None:
-            score_text = f"{overall['score']:.1f} / 100"
-        score_row = QLabel(
-            f"综合评分：{score_text}    "
-            f"维度覆盖：{overall.get('coverage', 0):.0%}    "
-            f"置信度：{overall.get('confidence', '低')}"
+        banner.setStyleSheet(
+            f"background:#f5f8fd; color:{action_color}; padding:12px; border-radius:8px; "
+            "font-size:16px; font-weight:700;"
         )
-        score_row.setStyleSheet("color:#475467; font-size:13px; padding:4px 8px;")
-        layout.addWidget(score_row)
+        layout.addWidget(banner)
 
-        text = QTextEdit()
-        text.setReadOnly(True)
+        tabs = QTabWidget()
+        tabs.addTab(self._text(self._overview(result)), "总览")
+        tabs.addTab(self._text(self._analysts(result)), "第一层 · 分析师")
+        if ta:
+            tabs.addTab(self._text(self._debate(ta.get("research") or {})), "第二层 · 研究辩论")
+            tabs.addTab(self._text(self._trading(ta.get("trading") or {})), "第三层 · 交易决策")
+            tabs.addTab(self._text(self._risk(ta.get("risk") or {})), "第四层 · 风险管理")
+        tabs.addTab(
+            self._text("## AI 研究总结\n\n" + str(result.get("llm_summary", "未生成"))), "AI 总结"
+        )
+        layout.addWidget(tabs, 1)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button, alignment=Qt.AlignRight)
+
+    @staticmethod
+    def _text(markdown):
+        widget = QTextEdit()
+        widget.setReadOnly(True)
+        widget.setMarkdown(markdown)
+        return widget
+
+    @staticmethod
+    def _overview(result):
+        overall = result.get("overall") or {}
+        score = overall.get("score")
         lines = [
-            "## 综合说明",
-            overall.get("explanation", ""),
+            "## 综合结论",
+            f"**{overall.get('label', '待判断')}**",
+            "",
+            str(overall.get("explanation", "")),
+            "",
+            f"- 综合评分：{f'{score:.1f}' if isinstance(score, (int, float)) else '—'} / 100",
+            f"- 维度覆盖：{overall.get('coverage', 0):.0%}",
+            f"- 置信度：{overall.get('confidence', '低')}",
+            f"- 最终操作建议：{overall.get('final_action', '—')}",
+            f"- 建议仓位：{overall.get('final_position', '—')}",
             "",
             "## 投资逻辑",
         ]
@@ -128,22 +162,30 @@ class StockAnalysisDialog(QDialog):
             f"- 日线数据条数：{result.get('history_rows', 0)}",
             f"- 最新日线日期：{result.get('history_latest_date', '未知')}",
             "",
-            "## 专项 Agent 分析",
+            "## 数据边界与风险提示",
+            "- 技术指标由 Futu 日线数据计算；财务、估值、公告、资金数据来自 Futu 对应接口，缺失项均明确标记，未使用虚构数值。",
+            "- 多空辩论、交易建议与仓位评估均为规则化研究信号，不构成投资建议；卖出对空仓者表示回避。",
+            "- 市场有风险，投资需谨慎。任何决策应结合个人风险承受能力独立判断。",
         ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _analysts(result):
+        lines = ["## 第一层 · 分析师团队"]
         for agent in result.get("agents", []):
+            score = agent.get("score")
+            score_text = f" · 评分 {score:.1f}" if isinstance(score, (int, float)) else ""
             lines += [
-                f"### {agent.get('agent', 'Agent')} · {agent.get('status', '')}"
-                + (f" · 评分 {agent['score']:.1f}" if isinstance(agent.get("score"), (int, float)) else ""),
+                "",
+                f"### {agent.get('agent', 'Agent')} · {agent.get('status', '')}{score_text}",
                 agent.get("conclusion", "暂无结论"),
             ]
-            metrics = []
             for key, value in agent.items():
                 if key in ("agent", "status", "conclusion", "risk_flags", "matched_sectors",
-                           "items", "top_tags", "dimensions") or value is None:
+                           "items", "top_tags", "dimensions", "evidence", "arguments", "rounds") or value is None:
                     continue
                 if isinstance(value, (int, float, str, bool)):
-                    metrics.append(f"- {key}: {value}")
-            lines.extend(metrics)
+                    lines.append(f"- {key}: {value}")
             for key, label in (("investment_logic", "投资逻辑"), ("risk_factors", "风险因素")):
                 if agent.get(key):
                     lines.append(f"- {label}：" + "；".join(str(x) for x in agent[key]))
@@ -151,23 +193,106 @@ class StockAnalysisDialog(QDialog):
                 lines.append("- 风险提示：" + "；".join(agent["risk_flags"]))
             if agent.get("matched_sectors"):
                 lines.append("- 匹配板块：" + "；".join(x["sector_name"] for x in agent["matched_sectors"]))
-            lines.append("")
-        lines += [
-            "## AI 研究总结",
-            result.get("llm_summary", "未生成"),
+        return "\n".join(lines)
+
+    @staticmethod
+    def _debate(debate):
+        bull = debate.get("bull_case") or {}
+        bear = debate.get("bear_case") or {}
+        lines = [
+            "## 第二层 · 多空研究辩论",
             "",
-            "## 数据边界与风险提示",
-            "- 技术指标由 Futu 日线数据计算；财务、估值、公告、资金数据来自 Futu 对应接口，缺失项均明确标记，未使用虚构数值。",
-            "- 财务指标以财报口径为准；毛利率阈值未做行业区分；估值分位为 Futu 计算的历史分位。",
-            "- 新闻 Agent 仅对标题做关键词事件标记，消息真伪与完整性须以交易所公告原文核实。",
-            "- 成交额、换手率、量比反映交易活跃度，不等于主力净流入；评级观点不等同于机构持仓。",
-            "- 综合评分为规则化研究信号，存在维度覆盖差异，不构成投资建议。市场有风险，投资需谨慎。",
+            "### 多头研究员",
+            str(bull.get("summary") or "暂无可核验证据。"),
         ]
-        text.setMarkdown("\n".join(lines))
-        layout.addWidget(text, 1)
-        close_button = QPushButton("关闭")
-        close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button, alignment=Qt.AlignRight)
+        lines += [f"- {e['text']}（{e['source']}·{e['strength']}）" for e in bull.get("arguments", [])]
+        lines += ["", "### 空头研究员", str(bear.get("summary") or "暂无可核验证据。")]
+        lines += [f"- {e['text']}（{e['source']}·{e['strength']}）" for e in bear.get("arguments", [])]
+        for rnd in debate.get("rounds", []):
+            lines += ["", f"### 第 {rnd.get('round')} 轮"]
+            bull_side = rnd.get("bull") or {}
+            bear_side = rnd.get("bear") or {}
+            if bull_side:
+                lines += [f"**多头陈述**：{bull_side.get('statement', '')}"]
+                lines += [f"- {x}" for x in bull_side.get("arguments", [])]
+            if bear_side:
+                lines += [f"**空头陈述**：{bear_side.get('statement', '')}"]
+                lines += [f"- {x}" for x in bear_side.get("arguments", [])]
+            if rnd.get("bull_rebuttal"):
+                lines += [
+                    f"**多头反驳**：{rnd['bull_rebuttal']}",
+                    f"**空头反驳**：{rnd.get('bear_rebuttal', '')}",
+                ]
+        judge = debate.get("judge") or {}
+        lines += ["", "### 研究主管裁决", f"**{judge.get('verdict', '—')}**", str(judge.get("reasoning", ""))]
+        plan = debate.get("investment_plan") or {}
+        lines += [
+            "", "### 投资计划",
+            f"- 核心假设：{plan.get('thesis', '—')}",
+            f"- 时间维度：{plan.get('time_horizon', '—')}",
+            "- 入场观察条件：" + "；".join(plan.get("entry_conditions") or []),
+            "- 退出观察条件：" + "；".join(plan.get("exit_conditions") or []),
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _trading(trader):
+        lines = [
+            "## 第三层 · 交易决策",
+            "",
+            f"### {trader.get('action', '待判断')}（{trader.get('action_code', '—')}）"
+            f"　置信度：{trader.get('confidence', '—')}",
+            "",
+            f"- 研究裁决：{trader.get('verdict', '—')}",
+            f"- 决策依据：{trader.get('reason', '—')}",
+            f"- 关注区间：{trader.get('entry_zone', '—')}",
+            f"- 时间维度：{trader.get('time_horizon', '—')}",
+            "",
+            "### 交易逻辑",
+            str(trader.get("thesis", "")),
+            "",
+            "### 失效条件",
+        ]
+        lines += [f"- {x}" for x in trader.get("invalidation", [])]
+        lines += ["", "### 说明", str(trader.get("conclusion", ""))]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _risk(risk):
+        lines = [
+            "## 第四层 · 风险管理",
+            "",
+            f"### 风险等级：{risk.get('risk_level', '—')}（{risk.get('risk_score', '—')}/100）",
+            "",
+            "## 风险检查项",
+        ]
+        checks = risk.get("risk_checks") or []
+        lines += [f"- **{c['name']}（{c['level']}）**：{c['detail']}" for c in checks] if checks else ["- 未触发可核验的风险阈值"]
+        debate = risk.get("risk_debate") or {}
+        lines += ["", "## 三方风险观点"]
+        for key, label in (("aggressive", "激进视角"), ("conservative", "保守视角"), ("neutral", "中性视角")):
+            if debate.get(key):
+                lines += [f"### {label}", str(debate[key]), ""]
+        position = risk.get("position_size") or {}
+        lines += [
+            "## 仓位评估",
+            f"- 建议仓位：{position.get('recommended', '—')}",
+            f"- 仓位上限：{position.get('max_pct', '—')}%",
+            f"- 测算依据：{position.get('basis', '—')}",
+            "",
+            "## 策略审核",
+            f"- 审核结果：{(risk.get('strategy_review') or {}).get('result', '—')}",
+        ]
+        lines += [f"- {x}" for x in (risk.get("strategy_review") or {}).get("reasons", [])]
+        final = risk.get("final_decision") or {}
+        lines += ["", "## 最终执行决策",
+                  f"- 操作：{final.get('action', '—')}",
+                  f"- 仓位：{final.get('position', '—')}",
+                  f"- 审核：{final.get('review', '—')}",
+                  "- 附加条件："]
+        lines += [f"  - {x}" for x in final.get("conditions", [])]
+        lines += ["", str(risk.get("conclusion", ""))]
+        return "\n".join(lines)
 
 
 class MetricCard(QFrame):
@@ -221,7 +346,7 @@ class HunterWindow(QMainWindow):
         self.scan_button.setObjectName("scanButton")
         self.scan_button.clicked.connect(self.start_scan)
         header.addWidget(self.scan_button)
-        self.analyze_button = QPushButton("◎  多Agent分析所选股票")
+        self.analyze_button = QPushButton("◎  TradingAgents 深度研究")
         self.analyze_button.setEnabled(False)
         self.analyze_button.clicked.connect(self.analyze_selected_stock)
         header.addWidget(self.analyze_button)
@@ -416,7 +541,7 @@ class HunterWindow(QMainWindow):
         if not isinstance(sectors, pd.DataFrame):
             sectors = pd.DataFrame(sectors)
         self.analyze_button.setEnabled(False)
-        self.status_label.setText(f"正在对 {stock.get('name', '')}（{code}）执行多Agent分析……")
+        self.status_label.setText(f"正在对 {stock.get('name', '')}（{code}）执行 TradingAgents 四层研究……")
         self.analysis_worker = StockAnalysisWorker(
             stock, self.result.get("market_summary", {}), sectors
         )
@@ -427,9 +552,9 @@ class HunterWindow(QMainWindow):
 
     def on_stock_analysis_completed(self, result):
         self.analyze_button.setEnabled(True)
-        self.status_label.setText("个股多Agent分析完成。")
+        self.status_label.setText("TradingAgents 四层研究完成。")
         self.log_text.append(
-            f"多Agent分析完成：{result.get('stock', {}).get('name', '')} "
+            f"TradingAgents 研究完成：{result.get('stock', {}).get('name', '')} "
             f"{result.get('stock', {}).get('code', '')}"
         )
         self.analysis_dialog = StockAnalysisDialog(result, self)

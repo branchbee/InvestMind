@@ -25,7 +25,7 @@ BEARISH_WORDS = ["预减", "减持", "立案", "处罚", "诉讼", "亏损", "�
 class NewsAgent:
     """归类公告与资讯，输出可追溯的事件线索而非主观结论。"""
 
-    def run(self, notices=None, news=None, ratings=None, stock_name=""):
+    def run(self, notices=None, news=None, ratings=None, stock_name="", stock_code=""):
         notice_rows = self._rows(notices)
         news_rows = self._rows(news)
         rating_rows = self._rows(ratings)
@@ -52,8 +52,10 @@ class NewsAgent:
                     "related_securities": row.get("related_securities"),
                 })
 
-        # 相关度过滤：get_search_news 是关键词搜索，可能混入其他公司的消息
-        related = [x for x in items if self._is_related(x, stock_name)]
+        # 相关度过滤：get_search_news 是关键词搜索，可能混入其他公司的消息。
+        # 公告的 related_securities 通常返回股票代码，而检索关键词是中文简称，
+        # 因此必须同时用「名称 + 代码」匹配，否则会把本公司公告全部过滤掉。
+        related = [x for x in items if self._is_related(x, stock_name, stock_code)]
         unrelated_count = len(items) - len(related)
 
         notice_tags = {}
@@ -141,10 +143,51 @@ class NewsAgent:
         return text[:30]
 
     @staticmethod
-    def _is_related(item, stock_name):
-        if not stock_name:
-            return True
+    def _normalise_code(value):
+        """从 SH.600519 / 600519.SH / 600519 等形态提取 6 位 A 股代码。"""
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value or ""))
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _is_related(item, stock_name="", stock_code=""):
+        """用「名称 + 代码」双重口径判断资讯是否属于目标个股。
+
+        Futu 公告的 related_securities 通常只有代码，而检索关键词是中文简称，
+        只看名称会把本公司公告误判为无关；只看代码又会在证券列表缺失时误杀。
+        """
+        name = str(stock_name or "").strip()
+        code = NewsAgent._normalise_code(stock_code)
+        if not name and not code:
+            return True  # 没有任何标识时不做过滤，避免擅自丢弃数据
+
         related = item.get("related_securities") or []
-        if related and stock_name in str(related):
-            return True
-        return stock_name in str(item.get("title") or "")
+        if isinstance(related, (str, dict)):
+            related = [related]
+        related = list(related) if isinstance(related, (list, tuple)) else []
+        title = str(item.get("title") or "")
+
+        if code:
+            for entry in related:
+                if isinstance(entry, dict):
+                    candidates = [entry.get("code"), entry.get("symbol"), entry.get("security_code")]
+                else:
+                    candidates = [entry]
+                if any(NewsAgent._normalise_code(c) == code for c in candidates):
+                    return True
+            if code in title:
+                return True
+
+        if name:
+            if name in title:
+                return True
+            for entry in related:
+                if isinstance(entry, dict):
+                    related_name = str(entry.get("name") or entry.get("security_name") or "")
+                    if related_name and (name in related_name or related_name in name):
+                        return True
+                    # 兼容名称/代码出现在证券条目文本中的情形（旧版按 str(related) 匹配）
+                    if name in str(entry):
+                        return True
+                elif name in str(entry):
+                    return True
+        return False

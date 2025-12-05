@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pandas as pd
 
 from ashare_hunter.agents.financial_agent import FinancialAgent
@@ -16,7 +17,7 @@ from ashare_hunter.agents.valuation_agent import ValuationAgent
 from ashare_hunter.agents.news_agent import NewsAgent
 from ashare_hunter.agents.capital_agent import CapitalAgent
 from ashare_hunter.agents.decision_agent import DecisionAgent
-from ashare_hunter.agents.stock_analysis import StockAnalysisOrchestrator
+from ashare_hunter.agents.stock_analysis import StockAnalysisOrchestrator, RiskAgent
 
 
 def financial_bundle(items):
@@ -81,6 +82,15 @@ class ValuationAgentTest(unittest.TestCase):
         detail = {"available": True, "detail": {"trend": {"valuation_percentile": 0.35}}}
         self.assertAlmostEqual(ValuationAgent._percentile(detail), 35.0)
 
+    def test_multiples_not_formatted_as_percent(self):
+        """回归：PE/PB/PS 是倍数，不能像百分比那样加 % 显示。"""
+        result = ValuationAgent().run(snapshot={"available": True, "pe_ttm_ratio": 30.0,
+                                                "pb_ratio": 5.0, "ps_ratio": 4.0})
+        self.assertIn("PE(TTM) 30.00", result["conclusion"])
+        self.assertIn("PB 5.00", result["conclusion"])
+        self.assertNotIn("30.00%", result["conclusion"])
+        self.assertNotIn("PB 5.00%", result["conclusion"])
+
 
 class NewsAgentTest(unittest.TestCase):
     def test_classification_and_filter(self):
@@ -103,6 +113,41 @@ class NewsAgentTest(unittest.TestCase):
         self.assertEqual(result["status"], "数据不足")
         self.assertIsNone(result["score"])
         self.assertEqual(result["items"], [])
+
+    def test_chinese_name_with_code_matching(self):
+        """回归：公告只带代码时，中文简称 + 代码必须能匹配，否则真实公告全被过滤。"""
+        notices = {"available": True, "rows": [
+            {"title": "关于召开2025年年度股东大会的通知",
+             "related_securities": ["SH.600519"], "source": "上交所"},
+            {"title": "2025年年度报告摘要",
+             "related_securities": [{"code": "600519.SH", "name": "贵州茅台"}], "source": "上交所"},
+            {"title": "其他公司业绩预增公告", "related_securities": ["SZ.000001"]},
+        ]}
+        result = NewsAgent().run(notices=notices, stock_name="贵州茅台", stock_code="600519")
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(result["filtered_unrelated_count"], 1)
+        # 旧调用方式（仅传标识）仍可用，不破坏向后兼容
+        legacy = NewsAgent().run(notices=notices, stock_name="600519")
+        self.assertEqual(len(legacy["items"]), 2)
+
+
+class RiskAgentTest(unittest.TestCase):
+    @staticmethod
+    def _history(sigma):
+        np.random.seed(42)
+        close = pd.Series(100 * np.cumprod(1 + np.random.normal(0, sigma, 60)))
+        return pd.DataFrame({"close": close})
+
+    def test_normal_volatility_not_flagged(self):
+        """回归：A 股正常年化波动 25%-50%，不应被误标为高波动。"""
+        result = RiskAgent().run({"change_pct": 1.2}, self._history(0.02))
+        self.assertLess(result["annualized_volatility_pct"], 50)
+        self.assertFalse(any("波动较高" in f for f in result["risk_flags"]))
+
+    def test_high_volatility_flagged(self):
+        result = RiskAgent().run({"change_pct": 1.2}, self._history(0.05))
+        self.assertGreaterEqual(result["annualized_volatility_pct"], 50)
+        self.assertTrue(any("波动较高" in f for f in result["risk_flags"]))
 
 
 class CapitalAgentTest(unittest.TestCase):
@@ -162,6 +207,9 @@ class DecisionAgentTest(unittest.TestCase):
 class FakeProvider:
     """模拟 Provider：仅实现编排器会调用的接口。"""
 
+    def __init__(self):
+        self.news_keywords = []
+
     def get_daily_history(self, code, days=80):
         dates = pd.date_range("2026-01-01", periods=90, freq="B")
         return pd.DataFrame({
@@ -192,7 +240,15 @@ class FakeProvider:
         }}}
 
     def get_news(self, keyword, max_count=20, news_sub_type="ALL"):
-        return {"available": False, "reason": "测试环境无资讯接口"}
+        self.news_keywords.append(keyword)
+        if news_sub_type != "NOTICE":
+            return {"available": False, "reason": "测试环境仅模拟公告"}
+        # 标题不含公司名，只有 related_securities 带代码：
+        # 编排器若不传 stock_code，这条真实公告会被误过滤。
+        return {"available": True, "rows": [
+            {"title": "2025年度业绩预增公告",
+             "related_securities": ["SH.600519"], "source": "上交所"},
+        ]}
 
     def get_capital_flow(self, code, period_type="DAY", days=10):
         return {"available": True, "rows": [
@@ -227,6 +283,18 @@ class OrchestratorSmokeTest(unittest.TestCase):
         # 容错：个别数据源不可用不应中断整体
         self.assertFalse(result["data_sources"]["institutional"]["available"])
         self.assertTrue(result["overall"]["investment_logic"])
+        # 回归：编排器必须把股票代码传给新闻 Agent，否则公告全部被过滤
+        news_agent = next(a for a in result["agents"] if a["agent"] == "新闻 Agent")
+        self.assertEqual(news_agent["status"], "完成")
+        self.assertEqual(len(news_agent["items"]), 1)
+
+
+    def test_news_keyword_falls_back_to_code(self):
+        """回归：股票名称缺失时用代码检索，避免空关键词请求。"""
+        provider = FakeProvider()
+        StockAnalysisOrchestrator(provider).analyze({"code": "000001", "name": ""})
+        self.assertEqual(len(provider.news_keywords), 3)
+        self.assertTrue(all(k == "000001" for k in provider.news_keywords))
 
 
 if __name__ == "__main__":
