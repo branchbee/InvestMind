@@ -55,6 +55,90 @@ US_NO_QUOTE_EXCH = frozenset({
 # 快照请求单批上限（富途接口单次最多 400 个标的）
 SNAPSHOT_BATCH_SIZE = 400
 
+# 富途快照中市值相关字段：equity_valid=False（ETF / 窝轮 / 优先股等非正股）时
+# 这些字段无合法数值，统一按「缺失」处理，绝不填 0 冒充小市值。
+MARKET_CAP_COLUMNS = {
+    "total_market_val": "market_cap",          # 总市值（默认过滤口径）
+    "circular_market_val": "float_market_cap",  # 流通市值
+}
+
+
+def filter_by_market_cap(
+    df: pd.DataFrame,
+    min_market_cap: float = 0.0,
+    missing_policy: str = "keep",
+    field: str = "market_cap",
+    market: str = "US",
+) -> tuple[pd.DataFrame, dict]:
+    """按总市值下限过滤行情快照，返回 ``(过滤后的 DataFrame, 统计字典)``。
+
+    A 股 / 美股共用同一套规则，仅货币口径与日志文案不同：
+    ``market='SH'`` 时门槛为人民币元，``market='US'`` 时为美元。
+
+    - ``min_market_cap <= 0``：关闭过滤，不改变数据；
+    - 市值缺失 / 非正（非正股、无权益数据）：按 ``missing_policy`` 决定
+      ``keep``（保留并计数提示）或 ``exclude``（与低市值标的一并剔除）；
+    - 快照完全没有市值列（旧版 SDK / 离线 Provider）：按缺失处理，
+      默认保留并在统计中标 ``has_field=False``，绝不编造市值数值。
+
+    统计字典通过 ``DataFrame.attrs['market_cap_filter']`` 回传编排层，
+    用于界面提示与日志审计，不改变列结构。``threshold_usd`` 是兼容早期
+    美股版本保留的别名键，语义为「门槛值」（A 股时为人民币元）。
+    """
+    threshold = max(float(min_market_cap or 0.0), 0.0)
+    policy = "exclude" if str(missing_policy).strip().lower() == "exclude" else "keep"
+    us = str(market).upper() == "US"
+    label, unit, currency = ("美股", "美元", "USD") if us else ("A股", "元", "CNY")
+    before = len(df)
+    stats = {
+        "enabled": threshold > 0,
+        "threshold_usd": threshold,
+        "threshold": threshold,
+        "market": "US" if us else "SH",
+        "currency": currency,
+        "field": field,
+        "missing_policy": policy,
+        "has_field": field in df.columns,
+        "before": before,
+        "after": before,
+        "below": 0,
+        "missing": 0,
+        "missing_excluded": 0,
+    }
+    if df.empty or threshold <= 0:
+        return df, stats
+
+    if field not in df.columns:
+        stats["missing"] = before
+        if policy == "exclude":
+            stats["after"] = 0
+            stats["missing_excluded"] = before
+            logger.warning("%s快照缺少市值字段 %s，按 exclude 策略剔除全部 %d 个标的",
+                           label, field, before)
+            return df.iloc[0:0].copy(), stats
+        logger.warning("%s快照缺少市值字段 %s，市值门槛未生效（保留全部 %d 个标的）",
+                       label, field, before)
+        return df, stats
+
+    cap = pd.to_numeric(df[field], errors="coerce").astype("float64")
+    missing = cap.isna() | cap.le(0)
+    below = (~missing) & cap.lt(threshold)
+    drop_missing = missing & (policy == "exclude")
+    keep = ~(below | drop_missing)
+
+    stats["below"] = int(below.sum())
+    stats["missing"] = int(missing.sum())
+    stats["missing_excluded"] = int(drop_missing.sum())
+    out = df.loc[keep].copy()
+    stats["after"] = len(out)
+    logger.info(
+        "%s市值过滤：门槛 %.0f %s（%s），%d → %d 个，剔除低市值 %d 个，"
+        "市值缺失 %d 个（策略 %s，剔除 %d 个）",
+        label, threshold, unit, field, before, len(out), stats["below"],
+        stats["missing"], policy, stats["missing_excluded"],
+    )
+    return out, stats
+
 
 class FutuProvider:
     """
@@ -76,6 +160,10 @@ class FutuProvider:
         request_interval: float = 0.60,
         us_exclude_otc: bool = True,
         snapshot_batch_size: int = SNAPSHOT_BATCH_SIZE,
+        us_min_market_cap: float = 0.0,
+        us_missing_market_cap: str = "keep",
+        a_min_market_cap: float = 0.0,
+        a_missing_market_cap: str = "keep",
     ):
         self.host = host
         self.port = int(port)
@@ -87,6 +175,16 @@ class FutuProvider:
         # 美股 OTC 等无行情权限标的的源头过滤开关与快照分批大小
         self.us_exclude_otc = bool(us_exclude_otc)
         self.snapshot_batch_size = min(max(int(snapshot_batch_size), 1), SNAPSHOT_BATCH_SIZE)
+        # 两个市场各自独立的市值门槛，构造时由 GUI / CLI / 编排器从配置透传，
+        # 0 表示关闭。A 股只作用于 get_spot()，美股只作用于 get_us_spot()。
+        self.us_min_market_cap = max(float(us_min_market_cap or 0.0), 0.0)
+        self.us_missing_market_cap = (
+            "exclude" if str(us_missing_market_cap).strip().lower() == "exclude" else "keep"
+        )
+        self.a_min_market_cap = max(float(a_min_market_cap or 0.0), 0.0)
+        self.a_missing_market_cap = (
+            "exclude" if str(a_missing_market_cap).strip().lower() == "exclude" else "keep"
+        )
         self._last_request_at = 0.0
         self._last_plate_request_at = 0.0
         self._quote_ctx = None
@@ -94,9 +192,11 @@ class FutuProvider:
         self._spot_market: str = "SH"
         self._ensure_db()
         logger.info(
-            "FutuProvider 就绪：OpenD=%s:%s 缓存库=%s 快照批大小=%d OTC过滤=%s 请求间隔=%.2fs",
+            "FutuProvider 就绪：OpenD=%s:%s 缓存库=%s 快照批大小=%d OTC过滤=%s "
+            "A股市值门槛=%.0f元(缺失策略=%s) 美股市值门槛=%.0f美元(缺失策略=%s) 请求间隔=%.2fs",
             self.host, self.port, self.cache_db, self.snapshot_batch_size,
-            self.us_exclude_otc, self.request_interval,
+            self.us_exclude_otc, self.a_min_market_cap, self.a_missing_market_cap,
+            self.us_min_market_cap, self.us_missing_market_cap, self.request_interval,
         )
 
     @contextmanager
@@ -291,6 +391,17 @@ class FutuProvider:
             if col not in df:
                 df[col] = pd.NA
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # 市值：来自富途快照 total_market_val / circular_market_val（美股为美元，
+        # 即 last_price × issued_shares）。equity_valid=False 的非正股字段为 N/A
+        # 或 0，统一视为缺失，避免把「无数据」误判成「小市值」。
+        for src, dst in MARKET_CAP_COLUMNS.items():
+            if src in df.columns:
+                values = pd.to_numeric(df[src], errors="coerce").astype("float64")
+                df[dst] = values.mask(values.le(0))
+        for col in MARKET_CAP_COLUMNS.values():
+            if col not in df.columns:
+                df[col] = pd.NA
         if "change_pct" not in df:
             df["change_pct"] = pd.NA
         valid_prev = df["prev_close_price"].gt(0)
@@ -367,10 +478,22 @@ class FutuProvider:
                     requests[0], len(frames), len(skipped))
         return frames, skipped
 
-    def get_spot(self) -> pd.DataFrame:
-        """获取沪深 A 股快照；分批请求并自动跳过个别无行情标的。"""
+    def get_spot(self, min_market_cap: Optional[float] = None) -> pd.DataFrame:
+        """获取沪深 A 股快照；分批请求、跳过无行情标的并按总市值下限过滤。
+
+        ``min_market_cap``（人民币元）可运行时覆盖构造参数；过滤在写入
+        ``_spot_cache`` 之前完成，保证板块聚合与板块内选股口径一致。
+        """
         started = time.perf_counter()
-        logger.info("开始获取 A 股全市场快照")
+        threshold = (
+            self.a_min_market_cap if min_market_cap is None
+            else max(float(min_market_cap or 0.0), 0.0)
+        )
+        if threshold != self.a_min_market_cap:
+            # 同步实例值：get_sector_stocks 缓存未命中时会重新取快照，口径需一致
+            self.a_min_market_cap = threshold
+            logger.info("A 股市值门槛运行时调整为 %.0f 元", threshold)
+        logger.info("开始获取 A 股全市场快照：市值门槛=%.0f元", threshold)
         basic = self._get_all_a_share_basic()
         logger.debug("A 股静态信息 %d 条", len(basic))
         codes = basic["code"].astype(str).tolist()
@@ -383,10 +506,21 @@ class FutuProvider:
 
         quote = pd.concat(frames, ignore_index=True)
         df = self._shape_quote(basic, quote)
+        # 门槛在缓存写入之前生效：市场概览、板块聚合、板块内选股、
+        # 深度研究入口都只会看到达标标的（与美股链路对称）。
+        df, cap_stats = filter_by_market_cap(
+            df, threshold, self.a_missing_market_cap, market="SH"
+        )
+        df.attrs["snapshot_skipped"] = skipped
+        df.attrs["market_cap_filter"] = cap_stats
         self._spot_cache = df.copy()
         self._spot_market = "SH"
-        logger.info("A 股快照完成：%d 条，跳过 %d 个，耗时 %.3fs",
-                    len(df), len(skipped), time.perf_counter() - started)
+        logger.info(
+            "A 股快照完成：过滤前 %d 条 → 保留 %d 条（低市值剔除 %d / 市值缺失剔除 %d），"
+            "无权限跳过 %d 个，耗时 %.3fs",
+            cap_stats["before"], len(df), cap_stats["below"],
+            cap_stats["missing_excluded"], len(skipped), time.perf_counter() - started,
+        )
         log_df(logger, "A股快照", df)
         return df
 
@@ -424,21 +558,45 @@ class FutuProvider:
         basic.attrs["otc_excluded"] = excluded
         return basic
 
-    def get_us_spot(self, symbols: Optional[list[str]] = None) -> pd.DataFrame:
-        """获取美股全市场快照，输出字段与 A 股 get_spot 一致。
+    def get_us_spot(self, symbols: Optional[list[str]] = None,
+                    min_market_cap: Optional[float] = None) -> pd.DataFrame:
+        """获取美股全市场快照，输出字段与 A 股 get_spot 一致，含市值字段。
 
         默认扫描全部美股（用于板块聚合）。symbols 参数仅保留给离线测试/调试
         限定代码范围，生产路径不再依赖观察池。
+
+        ``min_market_cap``（美元）在返回前按总市值过滤，并用同一份过滤后的
+        快照覆盖 ``_spot_cache``，保证后续板块聚合与板块内选股都看不到
+        低市值标的；None 时取构造参数 ``us_min_market_cap``。
         """
         started = time.perf_counter()
         skipped: list[str] = []
         otc_excluded = 0
-        logger.info("开始获取美股快照：范围=%s", "限定代码" if symbols else "全市场")
+        threshold = (
+            self.us_min_market_cap if min_market_cap is None
+            else max(float(min_market_cap or 0.0), 0.0)
+        )
+        if threshold != self.us_min_market_cap:
+            # 同步实例值：get_sector_stocks 缓存未命中时会重新取快照，口径需一致
+            self.us_min_market_cap = threshold
+            logger.info("美股市值门槛运行时调整为 %.0f 美元", threshold)
+        logger.info("开始获取美股快照：范围=%s 市值门槛=%.0f美元",
+                    "限定代码" if symbols else "全市场", threshold)
         if symbols:  # 仅测试/调试用途
             codes = [self._normalise_code(s) for s in symbols]
             frames, skipped = self._fetch_snapshots(codes)
             if not frames:
-                return pd.DataFrame(columns=["code", "name", "price", "change_pct", "amount", "turnover", "volume_ratio"])
+                empty = pd.DataFrame(columns=[
+                    "code", "name", "price", "change_pct", "amount",
+                    "turnover", "volume_ratio", "market_cap", "float_market_cap",
+                ])
+                empty["market"] = "US"
+                empty.attrs["snapshot_skipped"] = skipped
+                empty.attrs["otc_excluded"] = otc_excluded
+                empty.attrs["market_cap_filter"] = filter_by_market_cap(
+                    empty, threshold, self.us_missing_market_cap, market="US"
+                )[1]
+                return empty
             quote = pd.concat(frames, ignore_index=True).drop_duplicates("code")
             basic = quote[["code"]].copy()
             basic["name"] = quote["name"] if "name" in quote else ""
@@ -469,13 +627,24 @@ class FutuProvider:
             df = self._shape_quote(basic, quote)
 
         df["market"] = "US"
-        # 容错统计通过 attrs 回传编排层：不改变列结构与函数签名，兼容离线测试
+        # 市值门槛在缓存写入之前生效：市场概览、板块聚合、板块内选股、
+        # 单股深度研究入口都只会看到达标标的。
+        df, cap_stats = filter_by_market_cap(
+            df, threshold, self.us_missing_market_cap, market="US"
+        )
+        # 统计通过 attrs 回传编排层：不改变列结构，兼容离线测试
         df.attrs["snapshot_skipped"] = skipped
         df.attrs["otc_excluded"] = otc_excluded
+        df.attrs["market_cap_filter"] = cap_stats
         self._spot_cache = df.copy()
         self._spot_market = "US"
-        logger.info("美股快照完成：%d 条，OTC 过滤 %d 个，无权限跳过 %d 个，耗时 %.3fs",
-                    len(df), otc_excluded, len(skipped), time.perf_counter() - started)
+        logger.info(
+            "美股快照完成：过滤前 %d 条 → 保留 %d 条（低市值剔除 %d / 市值缺失剔除 %d），"
+            "OTC 过滤 %d 个，无权限跳过 %d 个，耗时 %.3fs",
+            cap_stats["before"], len(df), cap_stats["below"],
+            cap_stats["missing_excluded"], otc_excluded, len(skipped),
+            time.perf_counter() - started,
+        )
         log_df(logger, "美股快照", df)
         return df
 
@@ -663,16 +832,27 @@ class FutuProvider:
         rows["code"] = rows["futu_code"].map(self._code6)
         expected_market = "US" if market == "US" else "SH"
         if self._spot_cache is None or self._spot_market != expected_market:
-            logger.debug("板块选股 %s：快照缓存未命中，重新获取 %s 快照", name, expected_market)
-            spot = self.get_us_spot() if market == "US" else self.get_spot()
+            logger.debug("板块选股 %s：快照缓存未命中，重新获取 %s 快照（沿用市值门槛）",
+                         name, expected_market)
+            spot = (
+                self.get_us_spot(min_market_cap=self.us_min_market_cap)
+                if market == "US"
+                else self.get_spot(min_market_cap=self.a_min_market_cap)
+            )
         else:
-            logger.debug("板块选股 %s：复用 %s 快照缓存", name, expected_market)
+            logger.debug("板块选股 %s：复用 %s 快照缓存（已应用市值门槛）",
+                         name, expected_market)
             spot = self._spot_cache
         keep = [c for c in ["code", "name", "change_pct", "amount", "turnover",
-                            "volume_ratio", "price", "volume"] if c in spot.columns]
+                            "volume_ratio", "price", "volume",
+                            "market_cap", "float_market_cap"] if c in spot.columns]
+        # inner 而非 left：快照缓存已应用 OTC / 无行情权限 / 市值门槛过滤，
+        # 被过滤的成分股不应以「行情全空」的行重新出现在候选列表里。
         result = rows[["code", "name"]].merge(
-            spot[keep].drop_duplicates("code"), on="code", how="left", suffixes=("", "_quote")
+            spot[keep].drop_duplicates("code"), on="code", how="inner", suffixes=("", "_quote")
         )
+        logger.debug("板块成分股 %s(%s)：缓存 %d 条，命中有效快照 %d 条",
+                     name, market, len(rows), len(result))
         if "name_quote" in result:
             result["name"] = result["name"].replace("", pd.NA).fillna(result["name_quote"])
             result = result.drop(columns=["name_quote"])

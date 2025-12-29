@@ -10,7 +10,8 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-    QFrame, QMessageBox, QHeaderView, QStatusBar, QDialog, QComboBox
+    QFrame, QMessageBox, QHeaderView, QStatusBar, QDialog, QComboBox,
+    QDoubleSpinBox
 )
 
 from ashare_hunter.agents.stock_analysis import StockAnalysisOrchestrator
@@ -50,8 +51,13 @@ def display_value(value, column=""):
     return str(value)
 
 
-def _make_provider():
-    """构造 FutuProvider，A 股与美股共用同一套连接参数。"""
+def _make_provider(us_min_market_cap_usd=None, a_min_market_cap_cny=None):
+    """构造 FutuProvider，A 股与美股共用连接参数、各自独立的市值门槛。
+
+    ``us_min_market_cap_usd``（美元）/ ``a_min_market_cap_cny``（人民币元）
+    为 GUI 运行时调整值；None 时取 .env 配置。两个门槛分别只作用于
+    get_us_spot() / get_spot()，互不干扰。
+    """
     return FutuProvider(
         host=settings.futu_host,
         port=settings.futu_port,
@@ -60,6 +66,16 @@ def _make_provider():
         request_interval=settings.futu_request_interval,
         us_exclude_otc=settings.us_exclude_otc,
         snapshot_batch_size=settings.us_snapshot_batch_size,
+        us_min_market_cap=(
+            settings.us_min_market_cap_usd if us_min_market_cap_usd is None
+            else max(float(us_min_market_cap_usd or 0.0), 0.0)
+        ),
+        us_missing_market_cap=settings.us_missing_market_cap,
+        a_min_market_cap=(
+            settings.a_min_market_cap_cny if a_min_market_cap_cny is None
+            else max(float(a_min_market_cap_cny or 0.0), 0.0)
+        ),
+        a_missing_market_cap=settings.a_missing_market_cap,
     )
 
 
@@ -70,25 +86,35 @@ class MarketScanWorker(QThread):
     failed = Signal(str)
     message = Signal(str)
 
-    def __init__(self, market=MARKET_A):
+    def __init__(self, market=MARKET_A, min_market_cap=None, missing_market_cap=None):
         super().__init__()
         self.market = market
+        # 门槛单位随市场：A 股为人民币元，美股为美元
+        self.min_market_cap = min_market_cap
+        self.missing_market_cap = missing_market_cap
 
     def run(self):
         provider = None
         started = time.perf_counter()
         market = "US" if self.market == MARKET_US else "A"
-        logger.info("扫描 Worker 启动：市场=%s", market)
+        logger.info("扫描 Worker 启动：市场=%s 市值门槛=%s 缺失策略=%s",
+                    market, self.min_market_cap, self.missing_market_cap)
         try:
             if self.market == MARKET_US:
                 from ashare_hunter.graph.us_workflow import USMarketOrchestrator
-                provider = _make_provider()
-                result = USMarketOrchestrator(provider).scan(message=self.message.emit)
+                provider = _make_provider(us_min_market_cap_usd=self.min_market_cap)
+                result = USMarketOrchestrator(
+                    provider, min_market_cap_usd=self.min_market_cap,
+                    missing_market_cap=self.missing_market_cap,
+                ).scan(message=self.message.emit)
             else:
                 # 延迟导入：避免在缺少 langgraph 依赖时 GUI 无法启动
                 self.message.emit("正在连接 Futu OpenD 并获取行情……")
                 from ashare_hunter.graph.workflow import build_workflow
-                result = build_workflow().invoke({})
+                result = build_workflow(
+                    min_market_cap_cny=self.min_market_cap,
+                    missing_market_cap=self.missing_market_cap,
+                ).invoke({})
             logger.info("扫描 Worker 完成：市场=%s 耗时 %.3fs",
                         market, time.perf_counter() - started)
             self.completed.emit(result)
@@ -278,6 +304,40 @@ class StockAnalysisDialog(QDialog):
         lines += [f"- {e['text']}（{e['source']}·{e['strength']}）" for e in bull.get("arguments", [])]
         lines += ["", "### 空头研究员", str(bear.get("summary") or "暂无可核验证据。")]
         lines += [f"- {e['text']}（{e['source']}·{e['strength']}）" for e in bear.get("arguments", [])]
+
+        matrix = debate.get("evidence_matrix") or []
+        cov = debate.get("evidence_coverage") or {}
+        if matrix:
+            lines += [
+                "", "### 四层证据检查表",
+                f"可判定 {cov.get('answered', 0)}/{cov.get('total', 0)} 项；"
+                "「数据不足」项不参与多空计分，也不生成推断性结论。",
+            ]
+            by_layer = debate.get("evidence_by_layer") or {}
+            for layer in ("基本面", "技术面", "新闻面", "宏观面"):
+                rows = by_layer.get(layer) or []
+                if not rows:
+                    continue
+                stat = (cov.get("by_layer") or {}).get(layer) or {}
+                lines += ["", f"#### {layer}（{stat.get('answered', 0)}/{stat.get('total', 0)} 可判定）"]
+                for item in rows:
+                    mark = {"bull": "多头", "bear": "空头", "neutral": "中性",
+                            "unknown": "待补数据"}.get(item.get("direction"), "—")
+                    lines.append(
+                        f"- **[{item.get('answer')}｜{mark}｜{item.get('strength') or '—'}]** "
+                        f"{item.get('question')} — {item.get('detail')} "
+                        f"（来源：{item.get('source')}；数据时间：{item.get('as_of')}；"
+                        f"依据：{item.get('ref')}）"
+                    )
+        gaps = debate.get("unresolved_questions") or []
+        if gaps:
+            lines += ["", "### 尚缺数据（不参与裁决）"]
+            lines += [f"- {q}" for q in gaps]
+        caveats = debate.get("caveats") or []
+        if caveats:
+            lines += ["", "### 审慎提示"]
+            lines += [f"- {x}" for x in caveats]
+
         for rnd in debate.get("rounds", []):
             lines += ["", f"### 第 {rnd.get('round')} 轮"]
             bull_side = rnd.get("bull") or {}
@@ -288,6 +348,12 @@ class StockAnalysisDialog(QDialog):
             if bear_side:
                 lines += [f"**空头陈述**：{bear_side.get('statement', '')}"]
                 lines += [f"- {x}" for x in bear_side.get("arguments", [])]
+            for layer_view in rnd.get("layers") or []:
+                lines += ["", f"**{layer_view.get('layer')}**：多头 "
+                          f"{layer_view.get('bull_count', 0)} 条 / 空头 "
+                          f"{layer_view.get('bear_count', 0)} 条"]
+                lines += [f"  - 多：{x}" for x in layer_view.get("bull") or []]
+                lines += [f"  - 空：{x}" for x in layer_view.get("bear") or []]
             if rnd.get("bull_rebuttal"):
                 lines += [
                     f"**多头反驳**：{rnd['bull_rebuttal']}",
@@ -427,6 +493,23 @@ class HunterWindow(QMainWindow):
         self.market_combo.currentIndexChanged.connect(self._on_market_changed)
         header.addWidget(self.market_combo)
 
+        # 市值门槛：A股/美股通用，单位随市场切换（亿元 / 亿美元），各自记忆阈值
+        self.cap_label = QLabel("最低市值：")
+        header.addWidget(self.cap_label)
+        self.min_cap_spin = QDoubleSpinBox()
+        self.min_cap_spin.setObjectName("minCapSpin")
+        self.min_cap_spin.setRange(0.0, 100000.0)
+        self.min_cap_spin.setDecimals(1)
+        self.min_cap_spin.setSingleStep(1.0)
+        self._cap_values = {
+            MARKET_A: max(settings.a_min_market_cap_cny / 1e8, 0.0),
+            MARKET_US: max(settings.us_min_market_cap_usd / 1e8, 0.0),
+        }
+        self.min_cap_spin.setValue(self._cap_values[MARKET_A])
+        self.min_cap_spin.valueChanged.connect(self._on_cap_value_changed)
+        self._apply_cap_unit(MARKET_A)
+        header.addWidget(self.min_cap_spin)
+
         self.scan_button = QPushButton("▶  开始扫描")
         self.scan_button.setObjectName("scanButton")
         self.scan_button.clicked.connect(self.start_scan)
@@ -503,6 +586,7 @@ class HunterWindow(QMainWindow):
             QLabel#metricValue { color: #172033; font-size: 23px; font-weight: 700; }
             QLabel#metricHint { color: #98a2b3; font-size: 11px; }
             QComboBox#marketCombo { background: white; border: 1px solid #d0d9e8; border-radius: 8px; padding: 8px 12px; min-width: 130px; font-weight: 600; }
+            QDoubleSpinBox#minCapSpin { background: white; border: 1px solid #d0d9e8; border-radius: 8px; padding: 8px 12px; min-width: 130px; }
             QPushButton#scanButton { background: #2457d6; color: white; border: 0; border-radius: 8px; padding: 11px 20px; font-weight: 600; }
             QPushButton#scanButton:hover { background: #1948bd; }
             QPushButton#scanButton:disabled { background: #9aabd2; }
@@ -520,10 +604,33 @@ class HunterWindow(QMainWindow):
     def is_us(self):
         return self.current_market() == MARKET_US
 
+    def min_market_cap(self):
+        """当前市场最低总市值门槛：A 股为人民币元，美股为美元。"""
+        return float(self.min_cap_spin.value()) * 1e8
+
+    def _on_cap_value_changed(self, value):
+        """记录当前市场的门槛，切换市场时各自恢复，互不覆盖。"""
+        self._cap_values[self.current_market()] = float(value)
+
+    def _apply_cap_unit(self, market):
+        us = market == MARKET_US
+        self.min_cap_spin.setSuffix(" 亿美元" if us else " 亿元")
+        self.min_cap_spin.setToolTip(
+            f"低于该总市值的{'美股' if us else 'A 股'}在快照阶段即被剔除，"
+            "不参与板块聚合、选股与深度研究；设为 0 关闭市值过滤。"
+            f"口径为富途快照 total_market_val（{'美元' if us else '人民币元'}）。"
+        )
+
     def _on_market_changed(self):
-        """市场切换：更新文案、清空上次结果。两个市场共用同一套界面与板块 Tab。"""
+        """市场切换：更新文案、市值单位与各自门槛，并清空上次结果。"""
         us = self.is_us()
+        market = self.current_market()
         logger.info("市场切换为 %s，清空上次扫描结果", "美股（全市场）" if us else "A股（沪深）")
+        # 先阻塞 valueChanged 再恢复该市场自己的阈值，避免把 A 股值写入美股记忆
+        self.min_cap_spin.blockSignals(True)
+        self.min_cap_spin.setValue(self._cap_values.get(market, 0.0))
+        self.min_cap_spin.blockSignals(False)
+        self._apply_cap_unit(market)
         self.subtitle.setText(
             "美股全市场板块扫描 + TradingAgents 四层投研流水线（美元计价）" if us
             else "基于 Futu OpenD + TradingAgents 的 A 股板块/个股发现"
@@ -556,12 +663,28 @@ class HunterWindow(QMainWindow):
     def start_scan(self):
         self.scan_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
-        self.status_label.setText(
-            f"{'美股全市场' if self.is_us() else 'A股全市场'}扫描运行中：正在连接行情服务并计算板块与个股强度……"
+        min_cap = self.min_market_cap()
+        cap_unit = "亿美元" if self.is_us() else "亿元"
+        cap_text = (
+            f"（最低总市值 {min_cap / 1e8:.1f} {cap_unit}）" if min_cap > 0
+            else "（未启用市值过滤）"
         )
-        self.log_text.append(f"开始执行{'美股' if self.is_us() else 'A股'}全市场板块扫描。")
+        self.status_label.setText(
+            f"{'美股全市场' if self.is_us() else 'A股全市场'}"
+            f"扫描运行中{cap_text}：正在连接行情服务并计算板块与个股强度……"
+        )
+        self.log_text.append(
+            f"开始执行{'美股' if self.is_us() else 'A股'}全市场板块扫描 {cap_text}。"
+        )
         self.statusBar().showMessage("扫描中……")
-        self.worker = MarketScanWorker(market=self.current_market())
+        self.worker = MarketScanWorker(
+            market=self.current_market(),
+            min_market_cap=min_cap,
+            missing_market_cap=(
+                settings.us_missing_market_cap if self.is_us()
+                else settings.a_missing_market_cap
+            ),
+        )
         self.worker.message.connect(self.on_message)
         self.worker.completed.connect(self.on_completed)
         self.worker.failed.connect(self.on_failed)
@@ -599,7 +722,7 @@ class HunterWindow(QMainWindow):
         amount = market.get("total_amount_yuan", 0)
         self.card_amount.set_value(f"{amount / 1e8:.2f} {unit}", "快照成交额汇总")
         self.card_sector.set_value(len(sectors), "量化评分靠前的正涨幅板块")
-        self.card_stock.set_value(len(stocks), "通过过滤并完成综合排序")
+        self.card_stock.set_value(len(stocks), "通过市值/成交额/涨幅过滤并排序")
 
         # 两个市场都展示强势板块 Tab
         self._populate_table(self.sector_table, sectors, currency)
@@ -619,6 +742,19 @@ class HunterWindow(QMainWindow):
             lines.append(f"成交额口径：{market.get('amount_note', '美元')}")
         else:
             lines.append(f"报告文件：{result.get('report_path', '未生成')}")
+        cap = result.get("market_cap_filter") or {}
+        if cap.get("enabled"):
+            cap_unit = "亿美元" if us else "亿元"
+            threshold = float(cap.get("threshold", cap.get("threshold_usd", 0)) or 0)
+            lines.append(
+                f"市值门槛：{threshold / 1e8:.1f} {cap_unit}；"
+                f"过滤前 {cap.get('before', 0)} 只 → 保留 {cap.get('after', 0)} 只"
+                f"（低于门槛剔除 {cap.get('below', 0)} 只；市值缺失 "
+                f"{cap.get('missing', 0)} 只，按 {cap.get('missing_policy', 'keep')} "
+                f"策略剔除 {cap.get('missing_excluded', 0)} 只）"
+            )
+            if not cap.get("has_field"):
+                lines.append("注意：本次快照未提供总市值字段，市值门槛未实际生效。")
         lines += [
             "",
             "说明：板块强度由成分股快照聚合计算；候选股得分用于排序，不代表收益概率或买卖建议。"
@@ -642,7 +778,8 @@ class HunterWindow(QMainWindow):
             return
         preferred = [
             "sector_name", "name", "code", "board_type", "score", "change_pct",
-            "breadth", "up_count", "down_count", "amount", "turnover",
+            "breadth", "up_count", "down_count", "amount",
+            "market_cap", "float_market_cap", "turnover",
             "volume_ratio", "sector_names", "sector_score", "return_5d_pct",
             "ma5", "ma20", "above_ma5", "above_ma20",
         ]
@@ -653,8 +790,12 @@ class HunterWindow(QMainWindow):
         table.setRowCount(len(frame))
         for r, (_, row) in enumerate(frame[cols].iterrows()):
             for c, col in enumerate(cols):
-                if col == "amount" and currency == "USD" and isinstance(row[col], (int, float)) and pd.notna(row[col]):
+                numeric = isinstance(row[col], (int, float)) and pd.notna(row[col])
+                if col == "amount" and currency == "USD" and numeric:
                     text = f"{float(row[col]) / 1e8:,.2f} 亿美元"
+                elif col in ("market_cap", "float_market_cap") and numeric:
+                    unit = "亿美元" if currency == "USD" else "亿元"
+                    text = f"{float(row[col]) / 1e8:,.2f} {unit}"
                 else:
                     text = display_value(row[col], col)
                 item = QTableWidgetItem(text)
@@ -697,6 +838,22 @@ class HunterWindow(QMainWindow):
             QMessageBox.warning(self, "无法分析", f"没有找到 {code} 的扫描记录。")
             return
         stock = matched.iloc[0].to_dict()
+        # 二次防护：候选表已在快照阶段按市值过滤，这里再挡一次，确保
+        # 「低于门槛就不分析」不会因为结果回填或手工数据而失效。
+        cap_filter = self.result.get("market_cap_filter") or {}
+        threshold = float(
+            cap_filter.get("threshold", cap_filter.get("threshold_usd", 0)) or 0
+        )
+        cap = pd.to_numeric(pd.Series([stock.get("market_cap")]), errors="coerce").iloc[0]
+        if threshold > 0 and pd.notna(cap) and float(cap) < threshold:
+            cap_unit = "亿美元" if self.is_us() else "亿元"
+            QMessageBox.information(
+                self, "低于市值门槛",
+                f"{stock.get('name', code)}（{code}）总市值 "
+                f"{float(cap) / 1e8:,.2f} {cap_unit}，低于当前门槛 "
+                f"{threshold / 1e8:,.1f} {cap_unit}，已跳过深度研究。",
+            )
+            return
         sectors = self.result.get("top_sectors", pd.DataFrame())
         if not isinstance(sectors, pd.DataFrame):
             sectors = pd.DataFrame(sectors)

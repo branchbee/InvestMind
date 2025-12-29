@@ -1,13 +1,17 @@
 """多空研究辩论层：Bull / Bear 研究员陈述与反驳，Research Manager 裁决。
 
-沿用 TradingAgents 的研究团队结构，但论点全部来自本系统分析师 Agent 的
-真实结构化输出。规则化生成保证可复现、可审计；不编造任何证据或数据。
+沿用 TradingAgents 的研究团队结构，论点来自本系统分析师 Agent 的真实结构化
+输出，并按「基本面 / 技术面 / 新闻面 / 宏观面」四层检查表逐项取证。规则化生成
+保证可复现、可审计；缺数据的检查项明确标注「数据不足」，不编造证据或数据。
 """
 
 from .fundamental_base import score_label
+from .debate_evidence import LAYERS, build_evidence
 
 STRENGTH_WEIGHT = {"强": 3, "中": 2, "弱": 1}
-SOURCE_ORDER = {"财务": 0, "估值": 1, "新闻": 2, "资金": 3, "情绪": 4, "技术": 5, "风险": 6, "板块": 7}
+SOURCE_ORDER = {"财务": 0, "估值": 1, "新闻": 2, "资金": 3, "情绪": 4,
+                "技术": 5, "风险": 6, "板块": 7, "宏观": 8}
+LAYER_ORDER = (*LAYERS, "其他维度")
 
 
 def _yi(value):
@@ -21,9 +25,19 @@ def _score_text(value):
 class ResearchDebateAgent:
     """把分析师报告转化为多空论点、两轮辩论与投资计划。"""
 
-    def run(self, analyst_reports, composite_score=None, coverage=None):
+    def run(self, analyst_reports, composite_score=None, coverage=None, context=None):
         reports = analyst_reports if isinstance(analyst_reports, dict) else {}
         bull, bear = self._collect_evidence(reports)
+
+        # 四层证据检查表：仅把可核验的判定转成多空论点，数据不足项不参与计分
+        matrix = build_evidence(reports, context)
+        for arg in matrix["arguments"]:
+            target = bull if arg["direction"] == "bull" else bear
+            target.append({
+                "source": arg["source"], "text": arg["text"],
+                "strength": arg["strength"], "layer": arg["layer"],
+                "question": arg["question"], "answer": arg["answer"],
+            })
 
         bull.sort(key=lambda e: (-STRENGTH_WEIGHT[e["strength"]], SOURCE_ORDER.get(e["source"], 99)))
         bear.sort(key=lambda e: (-STRENGTH_WEIGHT[e["strength"]], SOURCE_ORDER.get(e["source"], 99)))
@@ -33,6 +47,8 @@ class ResearchDebateAgent:
         verdict, winner = self._verdict(bull_power, bear_power, composite_score)
 
         rounds = self._build_rounds(bull, bear, composite_score)
+        cov = matrix["coverage"]
+        unresolved = matrix["unresolved"]
         reasoning = (
             f"多头证据 {len(bull)} 条（强度合计 {bull_power}），"
             f"空头证据 {len(bear)} 条（强度合计 {bear_power}）。"
@@ -42,9 +58,32 @@ class ResearchDebateAgent:
             if coverage is not None:
                 reasoning += f"（覆盖 {coverage:.0%}）"
             reasoning += " 作为交叉验证。"
+        reasoning += (
+            f" 四层检查表 {cov['answered']}/{cov['total']} 项可判定，"
+            f"{len(unresolved)} 项数据不足（已列为待确认项，不参与计分）。"
+        )
+        caveats = []
+        if unresolved:
+            preview = "、".join(unresolved[:3]) + ("…" if len(unresolved) > 3 else "")
+            caveats.append(f"{len(unresolved)} 项检查数据不足、未纳入裁决（{preview}）")
+        if bull_power and bear_power:
+            ratio = max(bull_power, bear_power) / max(min(bull_power, bear_power), 1)
+            if ratio >= 3:
+                caveats.append(
+                    f"多空证据强度相差 {ratio:.1f} 倍，可能源于数据源覆盖偏向或反向线索缺失，"
+                    "需警惕确认偏误，结论宜降级为研究假设"
+                )
+        elif bull_power or bear_power:
+            caveats.append("仅单方有可核验证据，缺少对立面校验，结论稳健性有限")
+        if any(x["layer"] == "宏观面" and x["answer"] == "数据不足" for x in matrix["items"]):
+            caveats.append("宏观层缺少自动数据源（利率 / 产业景气度），方向判断未包含宏观验证")
+        if caveats:
+            reasoning += " 审慎提示：" + "；".join(caveats) + "。"
         reasoning += f" 研究主管裁决：{verdict}。"
 
         plan = self._build_plan(bull, bear, reports, verdict)
+        plan["evidence_gaps"] = unresolved
+        plan["layer_coverage"] = cov["by_layer"]
 
         return {
             "agent": "研究辩论 Agent",
@@ -53,13 +92,18 @@ class ResearchDebateAgent:
                           "summary": self._summary("多头", bull)},
             "bear_case": {"arguments": bear, "power": bear_power,
                           "summary": self._summary("空头", bear)},
+            "evidence_matrix": matrix["items"],
+            "evidence_by_layer": matrix["by_layer"],
+            "evidence_coverage": cov,
+            "unresolved_questions": unresolved,
+            "caveats": caveats,
             "rounds": rounds,
             "judge": {"verdict": verdict, "winner": winner, "reasoning": reasoning},
             "investment_plan": plan,
             "conclusion": (
                 f"多空辩论裁决：{verdict}。{reasoning}"
-                f" 投资计划：{plan['thesis']} 证据均来自分析师 Agent 的结构化输出，"
-                "辩论结论不构成买卖指令。"
+                f" 投资计划：{plan['thesis']} 证据来自分析师 Agent 的结构化输出与四层检查表，"
+                "数据不足项不作推断；辩论结论不构成买卖指令。"
             ),
         }
 
@@ -206,14 +250,56 @@ class ResearchDebateAgent:
         return f"{side}共 {len(arguments)} 条证据，核心论点：{top}。"
 
     @staticmethod
-    def _rebuttal(own, opponent, composite_score):
+    def _layer_of(e):
+        return e.get("layer") or "其他维度"
+
+    @classmethod
+    def _layer_view(cls, bull, bear):
+        """按四层整理双方论点，让证据覆盖面与缺口一眼可见。"""
+        view = []
+        for layer in LAYER_ORDER:
+            b = [e for e in bull if cls._layer_of(e) == layer]
+            s = [e for e in bear if cls._layer_of(e) == layer]
+            if not b and not s:
+                continue
+            view.append({
+                "layer": layer, "bull_count": len(b), "bear_count": len(s),
+                "bull": [e["text"] for e in b[:3]],
+                "bear": [e["text"] for e in s[:3]],
+            })
+        return view
+
+    @classmethod
+    def _rebuttal(cls, own, opponent, composite_score):
         if not opponent:
             return "对方未提出可核验的反向证据，本方论点未被削弱。"
-        target = opponent[0]["text"]
-        if own:
-            return f"针对『{target}』：{own[0]['text']}，该反向信号不足以推翻本方判断。"
-        score_text = f"综合评分 {composite_score:.1f}" if composite_score is not None else "现有数据"
-        return f"针对『{target}』：本方缺少可核验的对应证据，需以{score_text}及后续数据再确认。"
+        # 从对手最强证据中按层各挑一条逐层回应；同层无证据时明确列为待确认
+        picks, seen = [], set()
+        for e in opponent:
+            layer = cls._layer_of(e)
+            if layer in seen:
+                continue
+            seen.add(layer)
+            picks.append(e)
+            if len(picks) >= 2:
+                break
+        parts = []
+        for e in picks:
+            layer = cls._layer_of(e)
+            counter = next((x for x in own if cls._layer_of(x) == layer), None)
+            if counter:
+                parts.append(
+                    f"针对【{layer}】「{e['text']}」：本方同层证据「{counter['text']}」，"
+                    "两者需以后续数据共同验证。"
+                )
+            else:
+                score_text = (f"综合评分 {composite_score:.1f}"
+                              if composite_score is not None else "现有数据")
+                parts.append(
+                    f"针对【{layer}】「{e['text']}」：本方缺少同层可核验证据，"
+                    f"暂不强行反驳，以{score_text}列为待确认项。"
+                )
+        return " ".join(parts)
 
     @classmethod
     def _build_rounds(cls, bull, bear, composite_score):
@@ -226,6 +312,7 @@ class ResearchDebateAgent:
                          "arguments": [e["text"] for e in bull[:3]]},
                 "bear": {"statement": cls._summary("空头", bear),
                          "arguments": [e["text"] for e in bear[:3]]},
+                "layers": cls._layer_view(bull, bear),
             },
             {
                 "round": 2,
@@ -234,8 +321,28 @@ class ResearchDebateAgent:
             },
         ]
 
-    @staticmethod
-    def _build_plan(bull, bear, reports, verdict):
+    @classmethod
+    def _pick_by_layer(cls, arguments, limit=3):
+        """入场/退出条件尽量覆盖不同层面，避免三条证据全来自同一维度。"""
+        picked, seen = [], set()
+        for e in arguments:
+            layer = cls._layer_of(e)
+            if layer in seen:
+                continue
+            seen.add(layer)
+            picked.append(e["text"])
+            if len(picked) >= limit:
+                break
+        if len(picked) < limit:
+            for e in arguments:
+                if e["text"] not in picked:
+                    picked.append(e["text"])
+                    if len(picked) >= limit:
+                        break
+        return picked
+
+    @classmethod
+    def _build_plan(cls, bull, bear, reports, verdict):
         if verdict.startswith("偏多"):
             thesis = "多头证据占优，可将其作为方向性研究假设，等待入场条件确认。"
         elif verdict.startswith("偏空"):
@@ -248,7 +355,7 @@ class ResearchDebateAgent:
         return {
             "thesis": thesis,
             "verdict": verdict,
-            "entry_conditions": [e["text"] for e in bull[:3]] or ["等待更多可核验数据"],
-            "exit_conditions": [e["text"] for e in bear[:3]] or ["按预设风险阈值退出"],
+            "entry_conditions": cls._pick_by_layer(bull) or ["等待更多可核验数据"],
+            "exit_conditions": cls._pick_by_layer(bear) or ["按预设风险阈值退出"],
             "time_horizon": horizon,
         }

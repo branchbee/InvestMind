@@ -16,7 +16,17 @@ EVENT_RULES = [
     ("再融资", ["定增", "非公开发行", "配股", "可转债", "发行股份"]),
     ("风险事项", ["立案", "处罚", "诉讼", "仲裁", "ST", "退市", "违规", "冻结", "质押", "问询函", "监管函"]),
     ("分红", ["分红", "派息", "送股", "除权除息"]),
+    ("新产品/新技术", ["新产品", "新品", "发布新", "新一代", "量产", "技术突破", "获批", "专利", "认证", "首发"]),
+    ("行业政策/景气", ["行业景气", "景气度", "政策支持", "产业规划", "补贴", "行业利好", "需求增长", "涨价", "扩产", "行业复苏", "产业利好"]),
+    ("机构评级上调", ["上调评级", "评级上调", "调高评级", "上调目标价", "提高目标价", "升至买入", "上调至买入", "首次覆盖给予买入"]),
+    ("机构评级下调", ["下调评级", "评级下调", "调低评级", "下调目标价", "降低目标价", "降至卖出", "下调至卖出"]),
 ]
+
+# 供多空辩论使用的事件维度：标签 -> 辩论问题所需的可核验线索
+EVIDENCE_TAGS = (
+    "新产品/新技术", "重大合同/订单", "行业政策/景气",
+    "机构评级上调", "机构评级下调", "业绩预告", "风险事项",
+)
 
 BULLISH_WORDS = ["预增", "扭亏", "中标", "增持", "回购", "增长", "超预期", "盈利"]
 BEARISH_WORDS = ["预减", "减持", "立案", "处罚", "诉讼", "亏损", "下滑", "问询", "退市", "风险"]
@@ -94,9 +104,26 @@ class NewsAgent:
             )
 
         top_tags = sorted(notice_tags.items(), key=lambda kv: -kv[1])[:5]
+
+        # 事件证据：为多空辩论提供可回溯的标题、类型、时间与来源
+        event_evidence = {}
+        for item in related:
+            for tag in item["tags"]:
+                if tag not in EVIDENCE_TAGS:
+                    continue
+                bucket = event_evidence.setdefault(tag, {"count": 0, "samples": []})
+                bucket["count"] += 1
+                if len(bucket["samples"]) < 3:
+                    bucket["samples"].append({
+                        "title": item["title"], "type": item["type"],
+                        "publish_time": item.get("publish_time"),
+                        "source": item.get("source"), "url": item.get("url"),
+                    })
+
         return {
             "agent": "新闻 Agent", "status": "完成" if related else "数据不足",
             "score": score, "items": related[:20], "top_tags": top_tags,
+            "event_evidence": event_evidence,
             "bullish_count": bullish, "bearish_count": bearish,
             "filtered_unrelated_count": unrelated_count,
             "conclusion": conclusion,

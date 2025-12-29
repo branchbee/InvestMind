@@ -94,6 +94,9 @@ def _us_spot():
         "amount": [5e9, 4e9, 8e9, 6e9],
         "turnover": [0.5, 0.4, 0.9, 0.7],
         "volume_ratio": [1.2, 0.9, 1.8, 1.5],
+        # 模拟富途快照 total_market_val / circular_market_val（美股为美元）
+        "market_cap": [3.5e12, 3.0e12, 4.2e12, 1.1e12],
+        "float_market_cap": [3.4e12, 2.9e12, 4.1e12, 1.0e12],
         "code6": ["AAPL", "MSFT", "NVDA", "TSLA"],
         "market": "US",
     })

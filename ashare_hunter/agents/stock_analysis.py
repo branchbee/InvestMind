@@ -24,6 +24,12 @@ class TrendAgent:
             return {"agent": "趋势 Agent", "status": "数据不足", "conclusion": f"仅有 {len(close)} 根有效日线，至少需要 20 根"}
         last = float(close.iloc[-1])
         ma5, ma10, ma20 = (float(close.tail(n).mean()) for n in (5, 10, 20))
+        # 均线突破：昨日在 MA20 之下、今日站上（或反之），用于多空辩论的可核验事件
+        ma20_series = close.rolling(20).mean()
+        ma20_prev = float(ma20_series.iloc[-2]) if len(close) >= 21 and pd.notna(ma20_series.iloc[-2]) else None
+        close_prev = float(close.iloc[-2])
+        ma20_breakout = bool(ma20_prev is not None and close_prev <= ma20_prev and last > ma20)
+        ma20_breakdown = bool(ma20_prev is not None and close_prev >= ma20_prev and last < ma20)
         if last > ma5 > ma10 > ma20:
             trend = "多头排列"
             conclusion = "收盘价位于 MA5、MA10、MA20 之上，短中期趋势偏强"
@@ -39,6 +45,9 @@ class TrendAgent:
         return {
             "agent": "趋势 Agent", "status": "完成", "trend": trend,
             "last_close": last, "ma5": ma5, "ma10": ma10, "ma20": ma20,
+            "above_ma20": bool(last > ma20), "uptrend": trend == "多头排列",
+            "ma20_breakout": ma20_breakout, "ma20_breakdown": ma20_breakdown,
+            "as_of": str(history["date"].iloc[-1]) if "date" in history else None,
             "conclusion": conclusion
         }
 
@@ -66,6 +75,34 @@ class MomentumAgent:
         macd_line = ema12 - ema26
         signal = macd_line.ewm(span=9, adjust=False).mean()
         macd_hist = float((macd_line - signal).iloc[-1])
+
+        # MACD 金叉/死叉：样本需覆盖 26+9 根，短序列不制造信号
+        cross_up = (macd_line > signal) & (macd_line.shift(1) <= signal.shift(1))
+        cross_down = (macd_line < signal) & (macd_line.shift(1) >= signal.shift(1))
+        golden = dead = None
+        cross_date = None
+        if len(close) >= 35:
+            window = min(5, len(close))
+            golden = bool(cross_up.tail(window).any())
+            dead = bool(cross_down.tail(window).any())
+            recent = (cross_up | cross_down).tail(window)
+            if recent.any():
+                idx = recent[recent].index[-1]
+                if "date" in history.columns and idx in history.index:
+                    cross_date = str(history.loc[idx, "date"])
+
+        # 量能：近 5 日均量 / 之前 20 日均量；无成交量字段时明确标数据不足
+        volume_ratio = None
+        volume_status = "数据不足"
+        if "volume" in history.columns:
+            vol = pd.to_numeric(history["volume"], errors="coerce").dropna()
+            if len(vol) >= 25:
+                base = float(vol.iloc[-25:-5].mean())
+                latest = float(vol.tail(5).mean())
+                volume_ratio = round(latest / base, 2) if base > 0 else None
+                if volume_ratio is not None:
+                    volume_status = ("放大" if volume_ratio >= 1.2
+                                     else ("萎缩" if volume_ratio <= 0.8 else "持平"))
         if rsi_value is None:
             momentum = "指标不足"
         elif rsi_value >= 75:
@@ -80,6 +117,10 @@ class MomentumAgent:
             "agent": "动量 Agent", "status": "完成", **returns,
             "rsi14": rsi_value, "macd_hist": macd_hist,
             "momentum": momentum,
+            "macd_golden_cross": golden, "macd_dead_cross": dead,
+            "macd_cross_date": cross_date, "macd_cross_window": 5 if len(close) >= 35 else None,
+            "volume_expansion": volume_ratio, "volume_status": volume_status,
+            "as_of": str(history["date"].iloc[-1]) if "date" in history else None,
             "conclusion": f"动量状态：{momentum}；RSI(14)={rsi_value:.1f}" if rsi_value is not None else f"动量状态：{momentum}"
         }
 

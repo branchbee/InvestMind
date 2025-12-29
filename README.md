@@ -166,12 +166,40 @@ python -m tests.test_agents
 
 弹窗顶部横幅直接展示最终操作建议、研究裁决、建议仓位、风险等级与审核结果；下方标签页分别展示总览、分析师、研究辩论、交易决策、风险管理与 AI 总结。
 
+### 8.1 多空辩论的四层证据检查表
+
+第二层辩论把「基本面 / 技术面 / 新闻面 / 宏观面」共 **15 个检查问题**转成结构化证据，每条都带判定（是 / 否 / 部分 / 数据不足）、依据数值、数据来源、数据时间、证据出处与归入多头还是空头及强度。GUI「第二层 · 研究辩论」页新增「四层证据检查表」「尚缺数据」「审慎提示」三段，辩论第 1 轮按层列出双方论点，第 2 轮按层交叉反驳。
+
+| 层面 | 检查问题 | 真实数据依据 |
+| --- | --- | --- |
+| 基本面 | 营收是否持续增长、净利润是否增长、毛利率是否改善、ROE 是否提高 | `get_financials_statements` 多期年报序列：连续增长期数、相邻报告期变动、比率指标百分点差 |
+| 技术面 | 是否突破关键均线、MACD 是否金叉、成交量是否放大、是否形成上升趋势 | 前复权日线：MA20 上穿/下穿事件、DIF/DEA 近 5 日穿越、近 5 日均量 / 前 20 日均量、均线多头排列 |
+| 新闻面 | 新产品发布、重大订单、行业利好、机构上调评级 | `get_search_news`（NOTICE / NEWS / RATING）标题事件标签，附标题、时间、来源；评级概述仅有条数无方向时不判定 |
+| 宏观面 | 利率是否有利于科技股、AI 行业景气度是否提升、市场整体环境是否配合 | 市场 Agent 的 `market_regime` 为真实数据；利率与产业景气度**无自动数据源**，默认「数据不足」 |
+
+宏观层的口径约束（避免编造）：
+
+- 未接入政策利率 / 国债收益率 / 产业订单与资本开支数据，系统**不推断**利率方向或景气度；证据里写明缺少什么、需要补什么。
+- 需要纳入时可通过 `TradingAgentsOrchestrator.analyze(stock, market, sectors, macro={...})` 显式录入，**必须自带 `source` 与 `as_of`**，否则仍判数据不足；录入项一律标注「外部录入」、强度为「弱」，界面与日志可追溯。格式示例：
+
+```python
+macro = {
+    "rate": {"judgement": "有利", "value": "10Y 美债 4.1%", "source": "手动录入", "as_of": "2026-11-18"},
+    "industry": {"judgement": "提升", "value": "云厂商资本开支上修", "source": "手动录入", "as_of": "2026-11-18"},
+}
+```
+
+- 未录入时，科技 / AI 相关板块的**行情涨幅**只作为「间接代理」生成弱证据，文案明确「不等于产业景气度、订单或资本开支数据，也不代表本标的属于该行业」；非科技板块不会替代 AI 景气度。
+- 「未检索到新闻」不等于「事件不存在」；「数据不足」项不参与多空计分，全部列入「尚缺数据」清单。
+- 多空证据强度相差 3 倍以上、或仅单方有证据时，裁决附「确认偏误 / 缺少对立面校验」审慎提示，建议将结论降级为研究假设。
+
 **说明**：辩论与决策均为规则化、可追溯的推理，论点全部来自真实 Agent 输出，不编造证据；卖出建议对空仓者表示回避。仓位是研究上限而非建仓指令，不构成投资建议。
 
 ### 离线验证
 
 ```bash
 python -m tests.test_trading_agents
+python -m tests.test_debate_evidence   # 四层证据、宏观不编造、技术面真实计算、GUI 渲染
 ```
 
 ## 九、多市场研究（市场下拉框切换 A股 / 美股）
@@ -182,6 +210,7 @@ python -m tests.test_trading_agents
 
 1. 启动 Futu OpenD 并登录对应市场的行情权限账号（A股或美股，美股需含**板块数据**权限）。
 2. 在顶部「市场」下拉框选择目标市场；切换时自动清空上次扫描结果，避免两市场数据混淆。
+   - 「最低市值」输入框对**两个市场都可用**，单位随市场切换：A 股为**亿元**（默认 50 亿元，即 `A_MIN_MARKET_CAP_CNY=5000000000`），美股为**亿美元**（默认 10 亿美元，即 `US_MIN_MARKET_CAP_USD=1000000000`）。两个市场各自记忆阈值、互不干扰；可在每次扫描前直接调整，设为 `0` 关闭市值过滤，界面值优先级高于 `.env`。
 3. 点击「扫描」：两个市场走**同一条板块扫描链路**——
    全市场快照 → 板块聚合（行业/概念板块成分股当日表现）→ 板块强度排名 → 从强势板块内选股 → 日线补充 MA5/MA20/5 日收益。
    - 美股首次扫描会建立板块成分股缓存（受 `FUTU_MAX_PLATE_REFRESH_PER_RUN` 限流，逐步补齐）；
@@ -198,14 +227,32 @@ python -m tests.test_trading_agents
 - **复用四层流水线**：`USMarketOrchestrator.analyze()` 直接复用 `TradingAgentsOrchestrator`；财报 Agent 增加英文财报字段别名（Total Revenue / Net Income / Return on Equity / Gross Profit Margin）。
 - **美元计价**：成交额按「亿美元」展示；快照字段沿用 `total_amount_yuan` 名称以兼容展示层，实际口径为美元，界面已标注。
 - **美股 OTC 容错**：`get_stock_basicinfo(Market.US, STOCK)` 会返回 OTC 粉单（`US_PINK`）等标的，账号通常没有这类行情权限；而 `get_market_snapshot` 是「整批语义」——批内任一代码无权限，整批都会失败（如「暂不提供美股 OTC 市场行情」）。因此扫描前按 `exchange_type` 从源头剔除 OTC/期权/期货等标的；对残留的无权限、退市标的，快照请求在单批失败时**递归二分定位并跳过坏代码**，保留同批其余可用标的，不再让个别标的拖垮整个扫描。状态栏会显示过滤与跳过数量，A 股快照复用同一容错逻辑。
+- **双市场市值门槛**：快照字段 `total_market_val`（总市值，`last_price × issued_shares`）统一规整为 `market_cap`，`circular_market_val` 规整为 `float_market_cap`；A 股单位为**人民币元**（界面按亿元展示），美股为**美元**（按亿美元展示）。低于门槛的标的在**快照阶段**即被剔除，并用过滤后的快照覆盖缓存，因此市场概览、板块强度聚合、板块内选股、候选表和深度研究入口都只会看到达标标的；候选表新增「总市值 / 流通市值」两列。深度研究入口另有一道二次防护，拒绝分析低于门槛的标的。
+  - 两个市场门槛**完全隔离**：`A_MIN_MARKET_CAP_CNY` + `A_MISSING_MARKET_CAP` 只作用于 `get_spot()`，`US_MIN_MARKET_CAP_USD` + `US_MISSING_MARKET_CAP` 只作用于 `get_us_spot()`；底层 `filter_by_market_cap(..., market='SH'/'US')` 共用同一套规则，统计中带 `market` / `currency` 便于审计。GUI 输入框随市场切换单位并分别记忆各自数值。
+  - `equity_valid=False` 的非正股（ETF、优先股等）市值字段为 `N/A` 或 `0`，统一按**缺失**处理而非小市值：默认 `keep` 保留并单独计数提示，设为 `exclude` 则一并剔除；快照完全没有市值字段时默认不误杀，并明确提示「市值门槛未实际生效」。
+  - 板块成分股与快照按 `inner` 合并，被过滤标的不会以「行情全空」的行重新进入候选表。A 股 LangGraph 工作流（`build_workflow(min_market_cap_cny=...)`）与美股编排器都支持运行时阈值覆盖；若 Provider 未内置数据层过滤，编排层会兜底执行同一规则并同步快照缓存。
 - **缺失数据处理**：任何接口失败或字段缺失都明确标记「数据不足」，不生成虚构数值。
 
 ### 配置（`.env`）
 
+A 股扫描筛选（市值门槛默认启用，设为 `0` 可关闭）：
+
+```env
+TOP_SECTORS=10
+TOP_STOCKS=30
+MIN_AMOUNT_YUAN=50000000          # 最低成交额（元）
+A_MIN_MARKET_CAP_CNY=5000000000   # 最低总市值（人民币元），默认 50 亿元；0 关闭
+A_MISSING_MARKET_CAP=keep         # 无有效市值时：keep 保留并提示 / exclude 一并剔除
+```
+
+美股：
+
 ```env
 US_TOP_SECTORS=10          # 美股强势板块数量
 US_TOP_STOCKS=30           # 候选个股数量
-US_MIN_AMOUNT_USD=10000000 # 美股最低成交额（美元）
+US_MIN_AMOUNT_USD=10000000   # 美股最低成交额（美元）
+US_MIN_MARKET_CAP_USD=1000000000  # 美股最低总市值（美元），默认 10 亿美元；0 关闭
+US_MISSING_MARKET_CAP=keep  # 无有效市值时：keep 保留并提示 / exclude 一并剔除
 US_EXCLUDE_OTC=true        # 剔除 OTC 粉单等无行情权限标的（默认 true）
 US_SNAPSHOT_BATCH_SIZE=400 # 快照单批代码数，富途上限 400
 ```
@@ -214,11 +261,19 @@ US_SNAPSHOT_BATCH_SIZE=400 # 快照单批代码数，富途上限 400
 
 **扫描美股时报 `get_market_snapshot 调用失败：暂不提供美股 OTC 市场行情`**：见上方「美股 OTC 容错」。默认已自动过滤并隔离这类标的；若仍失败，可把 `US_SNAPSHOT_BATCH_SIZE` 调小（如 100）以缩小单批受影响范围，或确认账号已开通美股基础行情（OTC 行情通常需单独开通）。若源头过滤误伤了个别标的，可设 `US_EXCLUDE_OTC=false`，批次容错仍会自动隔离坏代码。
 
+**提示「市值门槛未实际生效」或候选表市值显示为 `-`**：说明 Futu 快照没有返回 `total_market_val`（常见于行情权限不足、旧版 SDK，或标的 `equity_valid=False`）。可先升级 `futu` SDK 并确认账号对应市场的行情权限；界面「运行日志」的 DEBUG 日志会记录快照返回列名。在字段恢复前，系统**不会**把缺失市值当作小市值剔除，也不会编造数值。A 股与美股的判断逻辑相同，只是货币口径不同。
+
+**扫描后候选个股为 0**：先在「市场概览」查看「过滤前 N 只 → 保留 M 只」，若市值门槛过滤掉了全部标的，把「最低市值」调低或设为 `0`；也可检查成交额门槛（`MIN_AMOUNT_YUAN` / `US_MIN_AMOUNT_USD`）与 `*_MISSING_MARKET_CAP=exclude` 是否叠加过严。
+
+**A 股扫描结果比以前少了**：本版本起 A 股默认启用 **50 亿元**最低总市值门槛，小微盘股会在快照阶段被剔除。如需恢复原来的全市场扫描，把界面「最低市值」设为 `0`，或在 `.env` 设 `A_MIN_MARKET_CAP_CNY=0`。
+
 ### 离线验证
 
 ```bash
-python -m unittest discover -s tests -v  # 全量 73 项（含日志与 OTC 容错回归）
+python -m unittest discover -s tests -v  # 全量 140 项（含 A股/美股市值门槛回归）
 python -m tests.test_us_market           # 美股板块扫描与数据层测试
+python -m tests.test_us_market_cap       # 美股市值门槛专项（字段/策略/缓存/GUI）
+python -m tests.test_a_share_market_cap  # A 股市值门槛专项（配置/工作流/双市场隔离）
 python -m tests.test_gui_market_switch   # 市场下拉框切换测试（Qt offscreen）
 ```
 
@@ -322,7 +377,9 @@ PowerShell 用户可用等价脚本：
 - 打包产物不含 `.env`（含敏感配置），需用户首次运行时自行创建；
 - 若杀毒软件误报，属 PyInstaller 常见现象，可添加白名单或从源码运行（`python gui.py`）。
 
-截图
+演示截图
+![alt text](image-14.png)
+![alt text](image-13.png)
 ![alt text](image.png)
 
 ![alt text](image-1.png)

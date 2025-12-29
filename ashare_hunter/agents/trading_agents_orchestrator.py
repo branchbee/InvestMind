@@ -27,7 +27,12 @@ class TradingAgentsOrchestrator:
     def __init__(self, provider=None):
         self.base_orchestrator = StockAnalysisOrchestrator(provider)
 
-    def analyze(self, stock, market=None, sectors=None):
+    def analyze(self, stock, market=None, sectors=None, macro=None):
+        """单股四层研究。
+
+        macro 为可选的外部宏观录入（利率 / 产业景气度），必须自带 source 与
+        as_of；未录入时宏观层明确标记数据不足，不推断利率方向。
+        """
         started = time.perf_counter()
         logger.info("TradingAgents 四层研究开始：%s (%s)",
                     stock.get("name", ""), stock.get("code", ""))
@@ -57,13 +62,26 @@ class TradingAgentsOrchestrator:
         composite = decision.get("composite_score")
         coverage = decision.get("coverage")
 
-        # 第二层：多空研究辩论
+        # 第二层：多空研究辩论（四层证据检查表 + Bull / Bear / Research Manager）
         stage = time.perf_counter()
+        debate_context = {
+            "stock": stock,
+            "market": base.get("market") or market or {},
+            "sectors": sectors,
+            "macro": macro,
+        }
         debate = ResearchDebateAgent().run(
-            analysts, composite_score=composite, coverage=coverage
+            analysts, composite_score=composite, coverage=coverage,
+            context=debate_context,
         )
-        logger.info("第二层[多空辩论] 裁决=%s 耗时 %.3fs",
-                    (debate.get("judge") or {}).get("verdict"), time.perf_counter() - stage)
+        cov = debate.get("evidence_coverage") or {}
+        logger.info(
+            "第二层[多空辩论] 裁决=%s 四层证据=%s/%s 数据不足=%d 耗时 %.3fs",
+            (debate.get("judge") or {}).get("verdict"),
+            cov.get("answered", 0), cov.get("total", 0),
+            len(debate.get("unresolved_questions") or []),
+            time.perf_counter() - stage,
+        )
         # 第三层：交易决策
         stage = time.perf_counter()
         trader = TraderAgent().run(
