@@ -859,48 +859,92 @@ class FutuProvider:
         return result
 
     def get_daily_history(self, code: str, days: int = 45) -> pd.DataFrame:
+        """拉取前复权日线。
+
+        request_history_kline 返回 (ret, data, page_key) 三元组，与统一 ``_call``
+        假定的二元组不同，因此这里单独记录失败日志：否则上层只会看到
+        「趋势 Agent 数据不足」，日志文件里却查不到权限/限频/字段错误的原因。
+        """
         futu_code = self._normalise_code(code)
         end = datetime.now().date()
         start = end - timedelta(days=days * 2 + 10)
-        logger.debug("请求日线 %s：%s ~ %s，days=%d", futu_code, start, end, days)
+        params = f"{futu_code} {start} ~ {end} days={days} K_DAY QFQ"
+        started = time.perf_counter()
+        logger.debug("请求日线 | 参数: %s", params)
         self._pace()
-        ret, data, page_key = self._ctx().request_history_kline(
-            futu_code,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            ktype=ft.KLType.K_DAY,
-            autype=ft.AuType.QFQ,
-            max_count=1000,
-        )
-        if ret != ft.RET_OK:
-            raise RuntimeError(f"Futu 历史 K 线获取失败 {futu_code}：{data}")
-        frames = [data] if data is not None and not data.empty else []
-        # 当前请求范围一般少于 1000 根；若有分页则继续取完
-        while page_key is not None:
-            self._pace()
-            ret, page, page_key = self._ctx().request_history_kline(
+        try:
+            ret, data, page_key = self._ctx().request_history_kline(
                 futu_code,
                 start=start.isoformat(),
                 end=end.isoformat(),
                 ktype=ft.KLType.K_DAY,
                 autype=ft.AuType.QFQ,
                 max_count=1000,
-                page_req_key=page_key,
             )
+        except Exception as exc:
+            logger.error("Futu 历史 K 线请求异常（%.3fs）：%s: %s | 参数: %s",
+                         time.perf_counter() - started, type(exc).__name__, exc, params,
+                         exc_info=True)
+            raise
+        if ret != ft.RET_OK:
+            # ret/data 常含「无权限」「限频」「无此代码」等关键线索，必须完整入日志
+            logger.error("Futu 历史 K 线返回失败（%.3fs）：ret=%s data=%s | 参数: %s",
+                         time.perf_counter() - started, ret, data, params)
+            raise RuntimeError(f"Futu 历史 K 线获取失败 {futu_code}：{data}")
+        frames = [data] if data is not None and not data.empty else []
+        # 当前请求范围一般少于 1000 根；若有分页则继续取完
+        while page_key is not None:
+            self._pace()
+            try:
+                ret, page, page_key = self._ctx().request_history_kline(
+                    futu_code,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    ktype=ft.KLType.K_DAY,
+                    autype=ft.AuType.QFQ,
+                    max_count=1000,
+                    page_req_key=page_key,
+                )
+            except Exception as exc:
+                logger.error("Futu 历史 K 线分页异常（%.3fs）：%s: %s | 参数: %s",
+                             time.perf_counter() - started, type(exc).__name__, exc, params,
+                             exc_info=True)
+                raise
             if ret != ft.RET_OK:
+                logger.error("Futu 历史 K 线分页失败（%.3fs）：ret=%s data=%s | 参数: %s",
+                             time.perf_counter() - started, ret, page, params)
                 raise RuntimeError(f"Futu 历史 K 线分页失败 {futu_code}：{page}")
             if page is not None and not page.empty:
                 frames.append(page)
         if not frames:
-            logger.debug("日线 %s 返回空数据", futu_code)
+            logger.warning(
+                "日线 %s 返回空数据（%.3fs）：趋势/动量 Agent 将标记数据不足；"
+                "常见原因：无历史 K 线行情权限、标的退市/停牌、代码无效或区间内无交易日 | 参数: %s",
+                futu_code, time.perf_counter() - started, params,
+            )
             return pd.DataFrame(columns=["date", "close", "pct_change"])
-        hist = pd.concat(frames, ignore_index=True).drop_duplicates("time_key")
-        hist = hist.rename(columns={"time_key": "date", "change_rate": "pct_change"})
-        for col in ("close", "pct_change"):
-            if col in hist:
-                hist[col] = pd.to_numeric(hist[col], errors="coerce")
-        logger.debug("日线 %s 完成：%d 页 / %d 行", futu_code, len(frames), len(hist))
-        return hist.sort_values("date").reset_index(drop=True)
+        try:
+            hist = pd.concat(frames, ignore_index=True).drop_duplicates("time_key")
+            hist = hist.rename(columns={"time_key": "date", "change_rate": "pct_change"})
+            for col in ("close", "pct_change"):
+                if col in hist:
+                    hist[col] = pd.to_numeric(hist[col], errors="coerce")
+            hist = hist.sort_values("date").reset_index(drop=True)
+        except KeyError as exc:
+            raw_columns = list(pd.concat(frames, ignore_index=True).columns)
+            logger.error("日线 %s 字段解析失败：缺少 %s；实际列=%s（Futu SDK 版本可能变化）",
+                         futu_code, exc, raw_columns)
+            raise
+        valid_close = int(hist["close"].notna().sum()) if "close" in hist else 0
+        if "close" not in hist or valid_close < 20:
+            logger.warning("日线 %s 有效收盘价仅 %d 根（共 %d 行），趋势 Agent 至少需要 20 根；"
+                           "可能是次新股或 close 字段不可解析 | 参数: %s",
+                           futu_code, valid_close, len(hist), params)
+        else:
+            logger.info("日线 %s 完成：%d 页 / %d 行 / %d 根有效收盘，最新 %s，耗时 %.3fs",
+                        futu_code, len(frames), len(hist), valid_close,
+                        str(hist["date"].iloc[-1]), time.perf_counter() - started)
+        return hist
 
     # ------------------------------------------------------------------
     # 基本面 / 估值 / 资金 / 新闻 数据接口

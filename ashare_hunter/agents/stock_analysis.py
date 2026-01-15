@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import pandas as pd
 import numpy as np
@@ -6,6 +7,8 @@ import requests
 
 from config import settings
 from ashare_hunter.data.futu_provider import FutuProvider
+
+logger = logging.getLogger(__name__)
 
 # A 股个股年化波动率通常落在 25%-50%，50% 以上才算显著偏高。
 # 原阈值 4% 会把绝大多数正常股票误标为高波动，已上调并集中为常量便于调整。
@@ -234,7 +237,50 @@ class StockAnalysisOrchestrator:
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
+            # 早期版本静默吞掉异常，导致界面只显示「数据不足」而日志无线索
+            logger.warning("%s 调用失败（已降级）：%s: %s",
+                           label, type(exc).__name__, exc)
             return {"available": False, "reason": f"{label} 调用失败：{exc}"}
+
+    @staticmethod
+    def _history_diagnosis(raw):
+        """把日线结果规整为 ``(DataFrame, 诊断 dict)``，保留失败原因供 GUI/CLI 追溯。
+
+        趋势 Agent 只依赖 ``close`` 且至少需要 20 根有效值；这里用同一口径判断
+        「可用性」，避免结果里只剩一句笼统的「数据不足」。
+        """
+        source = "Futu 历史 K 线（前复权日线）"
+        if isinstance(raw, pd.DataFrame):
+            columns = [str(c) for c in raw.columns]
+            rows = int(len(raw))
+            valid_close = (
+                int(pd.to_numeric(raw["close"], errors="coerce").notna().sum())
+                if "close" in raw else 0
+            )
+            latest = str(raw["date"].iloc[-1]) if "date" in raw and rows else None
+            if rows == 0 or "close" not in raw:
+                reason = ("接口返回空表或缺少 close 列；常见原因：无历史 K 线行情权限、"
+                          "标的退市/停牌、代码无效或区间内无交易日")
+            elif valid_close < 20:
+                reason = (f"有效收盘价仅 {valid_close} 根，趋势 Agent 至少需要 20 根"
+                          "（次新股或 close 字段不可解析）")
+            else:
+                reason = None
+            return raw, {
+                "source": source, "available": reason is None,
+                "rows": rows, "valid_close_rows": valid_close,
+                "columns": columns, "latest_date": latest, "reason": reason,
+            }
+
+        reason = raw.get("reason") if isinstance(raw, dict) else None
+        if not reason:
+            reason = f"历史K线数据源未返回 DataFrame（实际类型 {type(raw).__name__}）"
+        logger.warning("日线不可用：%s；趋势/动量 Agent 将标记数据不足", reason)
+        return pd.DataFrame(columns=["date", "close"]), {
+            "source": source, "available": False,
+            "rows": 0, "valid_close_rows": 0,
+            "columns": [], "latest_date": None, "reason": str(reason),
+        }
 
     def analyze(self, stock, market=None, sectors=None):
         code = str(stock.get("code", ""))
@@ -242,9 +288,9 @@ class StockAnalysisOrchestrator:
         # 名称缺失时退化为代码检索，避免用空关键词请求资讯接口
         news_keyword = name or code
 
-        history = self._safe_fetch("历史K线", self.provider.get_daily_history, code, days=80)
-        if not isinstance(history, pd.DataFrame):
-            history = pd.DataFrame(columns=["date", "close"])
+        history_raw = self._safe_fetch("历史K线", self.provider.get_daily_history, code, days=80)
+        # 保留失败/空表原因，供 CLI 摘要与 GUI 分析师页展示；不再静默替换成空表
+        history, history_diag = self._history_diagnosis(history_raw)
 
         # 基本面 / 估值 / 新闻 / 资金：逐项容错拉取
         key_ind = self._safe_fetch("关键财务指标", self.provider.get_financials,
@@ -306,6 +352,7 @@ class StockAnalysisOrchestrator:
             "history_rows": int(len(history)),
             "history_latest_date": str(history["date"].iloc[-1]) if not history.empty and "date" in history else "未知",
             "data_sources": {
+                "history": history_diag,
                 "key_indicators": key_ind,
                 "income_statement": income,
                 "snapshot": snapshot,

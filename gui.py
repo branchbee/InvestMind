@@ -5,8 +5,8 @@ import traceback
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QObject, QThread, Signal, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
@@ -234,6 +234,11 @@ class StockAnalysisDialog(QDialog):
     def _overview(result):
         overall = result.get("overall") or {}
         score = overall.get("score")
+        history_diag = (result.get("data_sources") or {}).get("history") or {}
+        history_status = (
+            "可用" if history_diag.get("available", True)
+            else f"不可用：{history_diag.get('reason') or '原因未记录'}"
+        )
         lines = [
             "## 综合结论",
             f"**{overall.get('label', '待判断')}**",
@@ -257,6 +262,7 @@ class StockAnalysisDialog(QDialog):
             "",
             f"- 日线数据条数：{result.get('history_rows', 0)}",
             f"- 最新日线日期：{result.get('history_latest_date', '未知')}",
+            f"- 日线数据状态：{history_status}",
             "",
             "## 数据边界与风险提示",
             "- 技术指标由 Futu 日线数据计算；财务、估值、公告、资金数据来自 Futu 对应接口，缺失项均明确标记，未使用虚构数值。",
@@ -268,6 +274,17 @@ class StockAnalysisDialog(QDialog):
     @staticmethod
     def _analysts(result):
         lines = ["## 第一层 · 分析师团队"]
+        diag = (result.get("data_sources") or {}).get("history") or {}
+        if diag and not diag.get("available", True):
+            lines += [
+                "",
+                "> **日线数据不可用** — 趋势 / 动量 Agent 与技术面证据因此标记「数据不足」",
+                f"> 原因：{diag.get('reason') or '未提供'}",
+                f"> 返回 {diag.get('rows', 0)} 行，有效收盘 {diag.get('valid_close_rows', 0)} 根"
+                "（趋势 Agent 至少需要 20 根）。",
+                "> 排查方向：Futu OpenD 连接、历史 K 线行情权限、标的退市/停牌或次新股、接口限频；"
+                "详情见「运行日志」与日志文件。",
+            ]
         for agent in result.get("agents", []):
             score = agent.get("score")
             score_text = f" · 评分 {score:.1f}" if isinstance(score, (int, float)) else ""
@@ -461,8 +478,16 @@ class HunterWindow(QMainWindow):
         self.resize(1420, 900)
         self.worker = None
         self.analysis_worker = None
+        self.analysis_dialog = None
         self.result = None
+        # 深度研究按钮的状态机：idle / scanning / no_result / ready / busy
+        self._analyze_state = "idle"
+        self._analysis_started = None
+        self._analysis_tick = 0
         self._build_ui()
+        self._analysis_timer = QTimer(self)
+        self._analysis_timer.setInterval(400)
+        self._analysis_timer.timeout.connect(self._tick_analysis_progress)
         self._apply_style()
         self._on_market_changed()  # 初始化市场相关文案
 
@@ -475,6 +500,7 @@ class HunterWindow(QMainWindow):
         root.setSpacing(14)
 
         header = QHBoxLayout()
+        header.setSpacing(10)
         title_box = QVBoxLayout()
         title = QLabel("Market Hunter")
         title.setObjectName("mainTitle")
@@ -514,15 +540,34 @@ class HunterWindow(QMainWindow):
         self.scan_button.setObjectName("scanButton")
         self.scan_button.clicked.connect(self.start_scan)
         header.addWidget(self.scan_button)
-        self.analyze_button = QPushButton("◎  TradingAgents 深度研究")
+        self.analyze_button = QPushButton("深度研究 · 待扫描")
+        self.analyze_button.setObjectName("analyzeButton")
+        # 固定宽度：状态文案和标的名切换时工具栏不跳动、文字不被裁切
+        self.analyze_button.setFixedWidth(224)
         self.analyze_button.setEnabled(False)
+        # QPushButton.setText 会按 & 助记符重置 setShortcut，导致状态文案一变就丢快捷键。
+        # 快捷键改挂窗口级 QShortcut，主键盘回车与小键盘回车都支持。
+        self._analyze_shortcuts = [QShortcut(QKeySequence(seq), self) for seq in ("Ctrl+Return", "Ctrl+Enter")]
+        for shortcut in self._analyze_shortcuts:
+            shortcut.activated.connect(self.analyze_selected_stock)
+            shortcut.setEnabled(False)
+        self.analyze_button.setToolTip(
+            "请先完成一次市场扫描，再选择一只候选个股进行 TradingAgents 四层研究；快捷键：Ctrl+Enter"
+        )
         self.analyze_button.clicked.connect(self.analyze_selected_stock)
         header.addWidget(self.analyze_button)
         root.addLayout(header)
 
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
         self.status_label = QLabel("尚未扫描。")
         self.status_label.setObjectName("statusLabel")
-        root.addWidget(self.status_label)
+        self.selection_hint = QLabel("当前标的：—")
+        self.selection_hint.setObjectName("selectionHint")
+        self.selection_hint.setMinimumWidth(230)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.selection_hint)
+        root.addLayout(status_row)
 
         cards = QHBoxLayout()
         self.card_regime = MetricCard("市场环境", "—", "等待扫描")
@@ -549,6 +594,7 @@ class HunterWindow(QMainWindow):
 
         self.stock_table = self._make_table()
         self.stock_table.cellDoubleClicked.connect(self.analyze_selected_stock)
+        self.stock_table.itemSelectionChanged.connect(self._on_stock_selection_changed)
         self.tabs.addTab(self.stock_table, "候选个股")
 
         self.explanation = QTextEdit()
@@ -590,12 +636,160 @@ class HunterWindow(QMainWindow):
             QPushButton#scanButton { background: #2457d6; color: white; border: 0; border-radius: 8px; padding: 11px 20px; font-weight: 600; }
             QPushButton#scanButton:hover { background: #1948bd; }
             QPushButton#scanButton:disabled { background: #9aabd2; }
+            /* 深度研究：深色渐变作为投研主操作，与蓝色扫描按钮形成主次对比 */
+            QPushButton#analyzeButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1b2550, stop:1 #4356c9);
+                color: #ffffff; border: 0; border-radius: 8px;
+                padding: 11px 14px; font-weight: 600;
+            }
+            QPushButton#analyzeButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2b3a7d, stop:1 #5a70e6);
+            }
+            QPushButton#analyzeButton:pressed { background: #141d42; padding-top: 12px; padding-bottom: 10px; }
+            QPushButton#analyzeButton:disabled { background: #e9eef6; color: #98a2b3; border: 1px dashed #c9d5e8; }
+            QPushButton#analyzeButton[state="busy"] {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6a3fb5, stop:1 #9a5ad8);
+                color: #ffffff; border: 1px solid #8a4cc9;
+            }
+            QLabel#selectionHint { background: #ffffff; color: #31527a; border: 1px solid #dfe6f2; border-radius: 8px; padding: 10px 12px; font-weight: 600; }
+            QToolTip { background: #1f2a44; color: #ffffff; border: 0; padding: 6px 9px; border-radius: 5px; }
             QTabWidget::pane { border: 1px solid #e3e8f0; background: white; border-radius: 8px; }
             QTabBar::tab { background: #e9eef6; padding: 10px 18px; margin-right: 4px; border-top-left-radius: 7px; border-top-right-radius: 7px; }
             QTabBar::tab:selected { background: white; color: #2457d6; font-weight: 600; }
             QTableWidget, QTextEdit { background: white; border: 1px solid #e4e9f1; border-radius: 7px; gridline-color: #edf0f5; }
+            QTableWidget::item:selected { background: #d9e5ff; color: #14213d; }
             QHeaderView::section { background: #f2f5fa; color: #475467; border: 0; padding: 8px; font-weight: 600; }
         """)
+
+    # ---------- 深度研究按钮状态机 ----------
+    _ANALYZE_TIPS = {
+        "idle": "请先点击「开始扫描」，扫描完成后再选择一只候选个股进行 TradingAgents 四层研究。快捷键：Ctrl+Enter",
+        "scanning": "市场扫描进行中，扫描完成后才能对候选个股做深度研究。快捷键：Ctrl+Enter",
+        "no_result": "本次扫描没有产生候选个股，请调低最低市值门槛或稍后重试。快捷键：Ctrl+Enter",
+        "busy": "TradingAgents 四层研究正在后台运行，请等待当前任务完成。",
+    }
+
+    def _set_analyze_state(self, state, *, code="", name=""):
+        """统一按钮文案 / 可用性 / 配色 / 提示，避免各处 setEnabled 造成状态漂移。"""
+        self._analyze_state = state
+        for shortcut in getattr(self, "_analyze_shortcuts", ()):
+            shortcut.setEnabled(state == "ready")
+        button = self.analyze_button
+        button.setProperty("state", "busy" if state == "busy" else "normal")
+        # Qt 样式表不会自动追踪动态属性变化，需重新 polish 才能切换配色
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.update()
+
+        if state == "busy":
+            # 保持可点击以显示醒目的「研究中」状态；重复触发在槽入口统一拦截
+            button.setEnabled(True)
+            button.setCursor(Qt.CursorShape.WaitCursor)
+            button.setText("研究中 · 0s")
+            button.setToolTip(self._ANALYZE_TIPS["busy"])
+            self.selection_hint.setText(f"当前标的：{name}（{code}） · 研究中" if code else "当前标的：研究中")
+            return
+
+        button.setEnabled(state == "ready")
+        button.setCursor(Qt.CursorShape.PointingHandCursor if state == "ready" else Qt.CursorShape.ArrowCursor)
+        if state == "ready":
+            self._refresh_ready_button()
+            return
+        button.setText(
+            {
+                "idle": "深度研究 · 待扫描",
+                "scanning": "深度研究 · 扫描中",
+                "no_result": "深度研究 · 无候选",
+            }.get(state, "深度研究")
+        )
+        button.setToolTip(self._ANALYZE_TIPS.get(state, ""))
+        self.selection_hint.setText("当前标的：—")
+
+    def _candidate_frame(self):
+        frame = (self.result or {}).get("top_stocks", pd.DataFrame())
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+
+    def _selected_stock_brief(self):
+        """返回 (code, name)；代码取自 UserRole，避免表格格式化与排序干扰。"""
+        table = self.stock_table
+        row = table.currentRow()
+        if row < 0 or row >= table.rowCount():
+            return "", ""
+        code_col = next(
+            (
+                c
+                for c in range(table.columnCount())
+                if table.horizontalHeaderItem(c) and table.horizontalHeaderItem(c).text() == "code"
+            ),
+            -1,
+        )
+        if code_col < 0:
+            return "", ""
+        item = table.item(row, code_col)
+        if item is None:
+            return "", ""
+        code = str(item.data(Qt.UserRole) or item.text() or "")
+        name = ""
+        frame = self._candidate_frame()
+        if code and {"code", "name"}.issubset(frame.columns):
+            matched = frame[frame["code"].astype(str) == code]
+            if not matched.empty:
+                name = str(matched.iloc[0].get("name", "") or "")
+        return code, name
+
+    def _refresh_ready_button(self):
+        """把按钮作用对象写在按钮上，避免「点了不知道会分析哪只」。"""
+        code, name = self._selected_stock_brief()
+        label = f"{name}（{code}）" if code and name else code
+        if code:
+            self.analyze_button.setText(f"深度研究 · {code}")
+            self.analyze_button.setToolTip(
+                f"对 {label} 执行 TradingAgents 四层研究：分析师团队 → 多空辩论 → "
+                "交易决策 → 风险管理。快捷键：Ctrl+Enter"
+            )
+            self.selection_hint.setText(f"当前标的：{label}")
+        else:
+            self.analyze_button.setText("深度研究 · 选标的")
+            self.analyze_button.setToolTip(
+                "请在「候选个股」表格中选择一只标的，或双击该行；"
+                "直接点击本按钮将默认分析第一只候选股。快捷键：Ctrl+Enter"
+            )
+            self.selection_hint.setText("当前标的：未选择（点击默认分析首只）")
+
+    def _on_stock_selection_changed(self):
+        if self._analyze_state == "ready":
+            self._refresh_ready_button()
+
+    def _tick_analysis_progress(self):
+        """研究期间按秒刷新按钮与状态栏，替代原来「点了就灰掉」的无反馈状态。"""
+        if self._analyze_state != "busy" or self._analysis_started is None:
+            self._analysis_timer.stop()
+            return
+        self._analysis_tick += 1
+        elapsed = time.perf_counter() - self._analysis_started
+        dots = "·" * (self._analysis_tick % 3 + 1)
+        self.analyze_button.setText(f"研究中 {dots} {elapsed:.0f}s")
+        self.statusBar().showMessage(f"TradingAgents 四层研究进行中…… 已用时 {elapsed:.0f}s")
+
+    def _on_analysis_finished(self):
+        """由 QThread.finished 触发：线程真正结束才解锁，避免覆盖仍在运行的 Worker。"""
+        self._analysis_timer.stop()
+        self._analysis_started = None
+        worker = self.analysis_worker
+        self.analysis_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        # 即使状态被市场切换等路径提前重置，也必须恢复这两个入口，避免界面卡死
+        scan_busy = self.worker is not None and self.worker.isRunning()
+        self.scan_button.setEnabled(not scan_busy)
+        self.market_combo.setEnabled(not scan_busy)
+        if self._analyze_state != "busy":
+            return
+        if not self._candidate_frame().empty:
+            self._set_analyze_state("ready")
+        else:
+            self._set_analyze_state("idle" if self.result is None else "no_result")
+        self.statusBar().showMessage("研究任务已结束", 5000)
 
     # ---------- 市场切换 ----------
     def current_market(self):
@@ -646,7 +840,7 @@ class HunterWindow(QMainWindow):
 
     def _clear_results(self):
         self.result = None
-        self.analyze_button.setEnabled(False)
+        self._set_analyze_state("idle")
         for card in (self.card_regime, self.card_breadth, self.card_avg,
                      self.card_amount, self.card_sector, self.card_stock):
             card.set_value("—")
@@ -662,7 +856,8 @@ class HunterWindow(QMainWindow):
     # ---------- 扫描 ----------
     def start_scan(self):
         self.scan_button.setEnabled(False)
-        self.analyze_button.setEnabled(False)
+        self.market_combo.setEnabled(False)
+        self._set_analyze_state("scanning")
         min_cap = self.min_market_cap()
         cap_unit = "亿美元" if self.is_us() else "亿元"
         cap_text = (
@@ -701,6 +896,7 @@ class HunterWindow(QMainWindow):
     def on_completed(self, result):
         self.result = result
         self.scan_button.setEnabled(True)
+        self.market_combo.setEnabled(True)
         us = self.is_us()
         currency = "USD" if us else "CNY"
         unit = "亿美元" if us else "亿"
@@ -727,7 +923,12 @@ class HunterWindow(QMainWindow):
         # 两个市场都展示强势板块 Tab
         self._populate_table(self.sector_table, sectors, currency)
         self._populate_table(self.stock_table, stocks, currency)
-        self.analyze_button.setEnabled(not stocks.empty)
+        if stocks.empty:
+            self._set_analyze_state("no_result")
+        else:
+            self._set_analyze_state("ready")
+            # 自动选中首只：按钮立即显示待研究的代码，点击不再弹「请先选择」
+            self.stock_table.selectRow(0)
 
         lines = [
             f"扫描时间：{result.get('scan_time', '未知')}",
@@ -810,19 +1011,31 @@ class HunterWindow(QMainWindow):
 
     # ---------- 个股深度研究 ----------
     def analyze_selected_stock(self, *args):
+        """按钮 / 双击表格 / Ctrl+Enter 共用的深度研究入口。"""
+        if self._analyze_state == "busy" or (self.analysis_worker is not None and self.analysis_worker.isRunning()):
+            self.statusBar().showMessage("已有研究任务进行中，请等待当前任务完成。", 4000)
+            return
+        if self._analyze_state != "ready" or self.result is None:
+            self.statusBar().showMessage("请先完成市场扫描，并等待候选个股出现。", 4000)
+            return
         row_index = self.stock_table.currentRow()
         if row_index < 0:
-            QMessageBox.information(self, "请选择股票", "请先在候选个股表格中选择一只标的。")
-            return
-        if self.result is None:
-            QMessageBox.warning(self, "无法分析", "请先执行扫描。")
-            return
-        code_col = -1
-        for col in range(self.stock_table.columnCount()):
-            header = self.stock_table.horizontalHeaderItem(col)
-            if header and header.text() == "code":
-                code_col = col
-                break
+            if self.stock_table.rowCount() == 0:
+                QMessageBox.information(self, "无候选个股", "本次扫描没有可分析的候选个股。")
+                return
+            # 未选中时默认分析首只，避免弹窗打断操作流
+            self.stock_table.selectRow(0)
+            row_index = 0
+            self.status_label.setText("未选择标的，已默认分析候选个股第一只。")
+        code_col = next(
+            (
+                c
+                for c in range(self.stock_table.columnCount())
+                if self.stock_table.horizontalHeaderItem(c)
+                and self.stock_table.horizontalHeaderItem(c).text() == "code"
+            ),
+            -1,
+        )
         if code_col < 0:
             QMessageBox.warning(self, "无法分析", "候选股表格中没有代码字段。")
             return
@@ -830,9 +1043,7 @@ class HunterWindow(QMainWindow):
         code = code_item.data(Qt.UserRole) if code_item else None
         if not code and code_item:
             code = code_item.text()
-        stocks = self.result.get("top_stocks", pd.DataFrame())
-        if not isinstance(stocks, pd.DataFrame):
-            stocks = pd.DataFrame(stocks)
+        stocks = self._candidate_frame()
         matched = stocks[stocks["code"].astype(str) == str(code)]
         if matched.empty:
             QMessageBox.warning(self, "无法分析", f"没有找到 {code} 的扫描记录。")
@@ -841,14 +1052,13 @@ class HunterWindow(QMainWindow):
         # 二次防护：候选表已在快照阶段按市值过滤，这里再挡一次，确保
         # 「低于门槛就不分析」不会因为结果回填或手工数据而失效。
         cap_filter = self.result.get("market_cap_filter") or {}
-        threshold = float(
-            cap_filter.get("threshold", cap_filter.get("threshold_usd", 0)) or 0
-        )
+        threshold = float(cap_filter.get("threshold", cap_filter.get("threshold_usd", 0)) or 0)
         cap = pd.to_numeric(pd.Series([stock.get("market_cap")]), errors="coerce").iloc[0]
         if threshold > 0 and pd.notna(cap) and float(cap) < threshold:
             cap_unit = "亿美元" if self.is_us() else "亿元"
             QMessageBox.information(
-                self, "低于市值门槛",
+                self,
+                "低于市值门槛",
                 f"{stock.get('name', code)}（{code}）总市值 "
                 f"{float(cap) / 1e8:,.2f} {cap_unit}，低于当前门槛 "
                 f"{threshold / 1e8:,.1f} {cap_unit}，已跳过深度研究。",
@@ -857,36 +1067,54 @@ class HunterWindow(QMainWindow):
         sectors = self.result.get("top_sectors", pd.DataFrame())
         if not isinstance(sectors, pd.DataFrame):
             sectors = pd.DataFrame(sectors)
-        self.analyze_button.setEnabled(False)
-        self.status_label.setText(f"正在对 {stock.get('name', '')}（{code}）执行 TradingAgents 四层研究……")
+        name = str(stock.get("name", "") or "")
+        self._set_analyze_state("busy", code=str(code), name=name)
+        self._analysis_started = time.perf_counter()
+        self._analysis_tick = 0
+        self._analysis_timer.start()
+        self.status_label.setText(f"正在对 {name}（{code}）执行 TradingAgents 四层研究……")
+        self.statusBar().showMessage(f"正在研究 {name}（{code}）……")
+        self.market_combo.setEnabled(False)
+        self.scan_button.setEnabled(False)
+        self.log_text.append(f"启动四层研究：{name}（{code}）")
         self.analysis_worker = TradingAnalysisWorker(
-            stock, self.result.get("market_summary", {}), sectors,
+            stock,
+            self.result.get("market_summary", {}),
+            sectors,
             market=self.current_market(),
         )
         self.analysis_worker.completed.connect(self.on_stock_analysis_completed)
         self.analysis_worker.failed.connect(self.on_stock_analysis_failed)
         self.analysis_worker.message.connect(self.on_message)
+        # 线程真正结束才解锁，避免 completed 之后覆盖仍在收尾的 QThread
+        self.analysis_worker.finished.connect(self._on_analysis_finished)
         self.analysis_worker.start()
 
     def on_stock_analysis_completed(self, result):
-        self.analyze_button.setEnabled(True)
         scope = "美股" if self.is_us() else ""
         self.status_label.setText(f"{scope}TradingAgents 四层研究完成。")
         self.log_text.append(
-            f"研究完成：{result.get('stock', {}).get('name', '')} "
-            f"{result.get('stock', {}).get('code', '')}"
+            f"研究完成：{result.get('stock', {}).get('name', '')} " f"{result.get('stock', {}).get('code', '')}"
         )
+        # 复用单个结果窗口：先关闭旧窗口再置前，避免重复弹窗互相覆盖或失去焦点
+        previous = self.analysis_dialog
+        if previous is not None:
+            previous.close()
+            previous.deleteLater()
         self.analysis_dialog = StockAnalysisDialog(result, self)
         self.analysis_dialog.show()
+        self.analysis_dialog.raise_()
+        self.analysis_dialog.activateWindow()
 
     def on_stock_analysis_failed(self, error):
-        self.analyze_button.setEnabled(True)
         self.status_label.setText("个股分析失败，请检查行情权限、日线接口与接口配额。")
         self.log_text.append(error)
         QMessageBox.critical(self, "个股分析失败", error[-2500:])
 
     def on_failed(self, error):
         self.scan_button.setEnabled(True)
+        self.market_combo.setEnabled(True)
+        self._set_analyze_state("idle")
         self.status_label.setText("扫描失败。请检查 Futu OpenD、账号权限、网络和接口配额。")
         self.log_text.append(error)
         self.statusBar().showMessage("扫描失败")

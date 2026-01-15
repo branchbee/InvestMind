@@ -25,6 +25,8 @@ cp .env.example .env
 python main.py
 ```
 
+> 只想调试单只股票的 TradingAgents 四层研究、或需要离线复现，见[第十一章 CLI 四层研究调试](#十一cli-四层研究调试mainpy)。
+
 ## 二、数据接口映射
 
 | Agent 所需数据 | Futu API |
@@ -72,7 +74,69 @@ FUTU_MAX_PLATE_REFRESH_PER_RUN=0
 量化评分用于候选排序，不代表收益概率或买卖建议。正式使用前应加入历史回测、交易成本、幸存者偏差、停牌、涨跌停和数据可用性处理。
 
 
-## 六、Python Qt 可视化界面
+## 六、Agent 清单与分工
+
+`ashare_hunter/agents/` 共 23 个类，其中 **20 个是 Agent**，按职责分为三组：扫描链路 6 个、单股基础分析 10 个、TradingAgents 四层 4 个。全部采用规则化评分；任一数据源缺失时对应 Agent 标记「数据不足」，不生成虚构数值。输出是研究信号，不构成买卖指令。本章是速查索引，单股分析的详细数据口径见第八章，四层证据与裁决规则见第九章，命令行调试见第十一章。
+
+按统计口径不同会有三个数字：
+
+| 口径 | 数量 | 说明 |
+|---|---|---|
+| 类名以 `Agent` 结尾 | 20 | 本章列出的全部 Agent |
+| 实现 `run()` | 17 | 另 3 个入口是 `TechnicalAgent.enrich()`、`ResearchAgent.explain()`、`ReportAgent.save()` |
+| 产出结构化报告 | 14 | 带 `agent` 字段，会出现在深度研究弹窗与 CLI 输出中；扫描链 6 个返回 DataFrame 或文件路径 |
+
+### 6.1 扫描链路（6 个）
+
+由 `graph/workflow.py`（A 股 LangGraph 编排）与 `graph/us_workflow.py`（美股）共用，负责从全市场选出候选股。
+
+| Agent | 入口 | 功能 |
+|---|---|---|
+| `MarketAgent` | `run()` | 涨跌家数与平均涨幅判定市场「偏强 / 震荡 / 偏弱」，输出涨跌比与成交额合计 |
+| `SectorAgent` | `run()` | 板块四维打分（涨幅 35% + 宽度 30% + 领涨股 20% + 成交额 15%），取上涨板块 TopN |
+| `StockAgent` | `run()` | 拉取强势板块成分股 → 剔除 ST/退市、非上涨、成交额不足 → 按涨幅/换手/量比/板块分打分取 TopN |
+| `TechnicalAgent` | `enrich()` | 给候选股补 MA5、MA20、5 日收益、是否站上均线；单只失败只记 `history_status` 不中断扫描 |
+| `ResearchAgent` | `explain()` | 可选 LLM 解读市场、板块与候选股；未启用或调用失败时降级为明确文案，不编造数据 |
+| `ReportAgent` | `save()` | 输出 `output/` 下的板块/个股 CSV（UTF-8 BOM）与 Markdown 报告，附风险提示 |
+
+### 6.2 单股基础分析（10 个）
+
+由 `StockAnalysisOrchestrator.analyze()` 统一拉数、逐项容错（`_safe_fetch`）：任一接口失败只让对应 Agent 降级，不影响其他维度；日线失败原因保留在 `data_sources.history`，可在 CLI 与 GUI 中追溯（见第十二章）。趋势、动量、流动性、风险、板块联动 5 个集中在 `stock_analysis.py`。
+
+| Agent | 报告名 | 功能 |
+|---|---|---|
+| `TrendAgent` | 趋势 Agent | MA5/10/20 判定多头 / 空头 / 震荡排列，输出 MA20 突破与跌破、是否上升趋势（至少 20 根有效收盘） |
+| `MomentumAgent` | 动量 Agent | 5/10/20 日收益、RSI(14)、MACD 柱、近 5 根金叉/死叉及日期、量能放大倍数（≥1.2 为放大） |
+| `LiquidityAgent` | 流动性 Agent | 成交额、换手率、量比，按 A 股亿元 / 美股亿美元显示；明确成交额不等于资金净流入 |
+| `RiskAgent` | 风险 Agent | 当日涨跌幅、近 20 日年化波动率（>50% 提示）、最大回撤（>10% 提示），输出 `risk_flags` |
+| `SectorContextAgent` | 板块 Agent | 把个股 `sector_names` 与扫描出的强势板块匹配，给出所属板块涨幅与强度评分 |
+| `FinancialAgent` | 财务 Agent | ROE、营收/净利同比、毛利率及多期趋势（连续增长、毛利改善、ROE 变化）；兼容中英文字段别名 |
+| `ValuationAgent` | 估值 Agent | PE(TTM)、PB、PS、历史估值分位、PEG（仅 PE>0 且净利增速>0 时计算） |
+| `NewsAgent` | 新闻 Agent | 公告/资讯/评级三类检索，按 11 类事件规则标注（新产品、重大订单、行业政策、评级上调等）并过滤无关结果 |
+| `CapitalAgent` | 资金 Agent | 主力/超大/大单资金流（当日与累计）、资金分布、机构持股、分析师评级；缺失时按分项回退 |
+| `DecisionAgent` | 决策 Agent | 五维加权（财务 25 / 估值 25 / 资金 20 / 新闻 15 / 技术 15）→ 综合分、评级、置信度、覆盖率、投资逻辑与风险清单 |
+
+### 6.3 TradingAgents 四层（4 个）
+
+`TradingAgentsOrchestrator` 先复用 6.2 的 10 份报告，再逐层加工，**不新增数据源**。
+
+| 层 | Agent | 报告名 | 功能 |
+|---|---|---|---|
+| 第一层补充 | `SentimentAgent` | 情绪面 Agent | 汇总资讯多空条数、主力资金、价格动量、趋势与机构关注度 → 0–100 情绪分；缺失维度从分母剔除 |
+| 第二层 | `ResearchDebateAgent` | 研究辩论 Agent | 四层证据矩阵（基本面 / 技术面 / 新闻面 / 宏观面共 15 项）→ 多空论点、两轮辩论、主管裁决、证据覆盖率、尚缺数据与投资计划 |
+| 第三层 | `TraderAgent` | 交易 Agent | 买入 / 持有 / 卖出 + 置信度 + 关注区间（由真实均线推导，不给预测目标价）+ 失效条件 |
+| 第四层 | `RiskManagementAgent` | 风险管理 Agent | 风险等级与风险分、仓位上限、策略审核（通过 / 调整 / 驳回）、三方风险辩论、前置条件与最终执行决策 |
+
+### 6.4 容易混淆的命名与支撑类
+
+- **两个「板块」**：`SectorAgent` 做全市场板块**排名**；`SectorContextAgent`（报告名「板块 Agent」）做单只股票的**板块归属匹配**。
+- **两个「风险」**：`RiskAgent` 计算波动率、回撤等**风险指标**；`RiskManagementAgent` 是第四层**审核交易建议并给出仓位**。
+- **两个「决策」**：`DecisionAgent` 输出**综合评分**；`TraderAgent` 输出**买卖动作**；最终以第四层 `final_decision` 为准（审核驳回时仓位为 0）。
+- **3 个非 Agent 支撑类**：`DebateEvidenceBuilder`（`debate_evidence.py`，构造四层证据检查表）、`StockAnalysisOrchestrator`（基础分析编排 + 数据源容错 + 可选 LLM 总结）、`TradingAgentsOrchestrator`（四层编排）。`fundamental_base.py` 是纯函数工具（数值解析、字段别名、同比、阈值评分、格式化）。
+
+**调用路径**：GUI 扫描按钮 / `main.py scan` 走 6.1 的 6 个 Agent；GUI「深度研究」按钮 / `main.py analyze` / 美股 `USMarketOrchestrator.analyze()` 走 6.2 + 6.3，共 14 份结构化报告。
+
+## 七、Python Qt 可视化界面
 
 安装依赖后启动桌面端：
 
@@ -87,12 +151,12 @@ python gui.py
 - Agent 研究解读：展示 LLM 或规则生成的文字分析；
 - 运行日志：显示扫描状态和错误堆栈。
 
-扫描在后台线程执行，界面不会因行情请求而冻结。启动前仍需运行 Futu OpenD 并登录有相应行情权限的账号。
+顶部「深度研究」按钮会随扫描与选股状态切换：待扫描 / 扫描中 / 无候选 / 可研究 / 研究中，按钮上直接显示待研究标的代码，状态栏右侧同步显示「当前标的」。扫描在后台线程执行，界面不会因行情请求而冻结。启动前仍需运行 Futu OpenD 并登录有相应行情权限的账号。
 
 
-## 七、候选股单股多 Agent 深度分析
+## 八、候选股单股多 Agent 深度分析
 
-扫描完成后，在"候选个股"表格中双击一只股票，或选中股票后点击"TradingAgents 深度研究"。程序会在后台线程拉取该股票数据，并运行以下 Agent：
+扫描完成后，在「候选个股」表格中选中一只股票（或双击该行），点击顶部「深度研究」按钮，也可按 Ctrl+Enter。按钮会显示当前标的代码；未选中任何行时直接点击会默认分析第一只候选股。研究期间按钮变紫色并显示已用秒数，市场下拉框与扫描按钮暂时锁定，避免并发请求与结果错位；完成后结果弹窗置前展示。程序会在后台线程拉取该股票数据，并运行以下 Agent：
 
 **技术面 Agent（已有）**
 - 趋势 Agent：MA5 / MA10 / MA20 均线结构；
@@ -141,7 +205,7 @@ DECISION_WEIGHT_TECHNICAL=0.15
 python -m tests.test_agents
 ```
 
-## 八、TradingAgents 四层投研决策
+## 九、TradingAgents 四层投研决策
 
 单股深度研究在原有分析师团队之上，新增 TradingAgents 式的三层决策流水线。点击"TradingAgents 深度研究"后，程序在后台依次执行：
 
@@ -166,7 +230,7 @@ python -m tests.test_agents
 
 弹窗顶部横幅直接展示最终操作建议、研究裁决、建议仓位、风险等级与审核结果；下方标签页分别展示总览、分析师、研究辩论、交易决策、风险管理与 AI 总结。
 
-### 8.1 多空辩论的四层证据检查表
+### 9.1 多空辩论的四层证据检查表
 
 第二层辩论把「基本面 / 技术面 / 新闻面 / 宏观面」共 **15 个检查问题**转成结构化证据，每条都带判定（是 / 否 / 部分 / 数据不足）、依据数值、数据来源、数据时间、证据出处与归入多头还是空头及强度。GUI「第二层 · 研究辩论」页新增「四层证据检查表」「尚缺数据」「审慎提示」三段，辩论第 1 轮按层列出双方论点，第 2 轮按层交叉反驳。
 
@@ -202,7 +266,7 @@ python -m tests.test_trading_agents
 python -m tests.test_debate_evidence   # 四层证据、宏观不编造、技术面真实计算、GUI 渲染
 ```
 
-## 九、多市场研究（市场下拉框切换 A股 / 美股）
+## 十、多市场研究（市场下拉框切换 A股 / 美股）
 
 主窗口顶部提供「市场」下拉框，在 **A股（沪深）** 与 **美股（全市场）** 之间切换。两个市场**共用同一套界面**：强势板块表格、指标卡、候选个股表格、深度研究按钮与结果弹窗完全一致，不设独立美股 Tab，也没有观察池输入框。
 
@@ -215,7 +279,7 @@ python -m tests.test_debate_evidence   # 四层证据、宏观不编造、技术
    全市场快照 → 板块聚合（行业/概念板块成分股当日表现）→ 板块强度排名 → 从强势板块内选股 → 日线补充 MA5/MA20/5 日收益。
    - 美股首次扫描会建立板块成分股缓存（受 `FUTU_MAX_PLATE_REFRESH_PER_RUN` 限流，逐步补齐）；
    - 若账号无美股板块权限，扫描会降级为空板块并给出提示，不中断整体流程。
-4. 「强势板块」Tab 查看两个市场的板块强度排名；在「候选个股」表中选中一行（或双击）→ 点击「TradingAgents 深度研究」，弹出四层分析结果（分析师 / 研究辩论 / 交易决策 / 风险管理）。
+4. 「强势板块」Tab 查看两个市场的板块强度排名；在「候选个股」表中选中一行（或双击）→ 点击「深度研究」按钮（或 Ctrl+Enter），弹出四层分析结果（分析师 / 研究辩论 / 交易决策 / 风险管理）。扫描完成后会自动选中首只候选股，按钮即时显示其代码。
 
 ### 设计说明
 
@@ -270,7 +334,12 @@ US_SNAPSHOT_BATCH_SIZE=400 # 快照单批代码数，富途上限 400
 ### 离线验证
 
 ```bash
-python -m unittest discover -s tests -v  # 全量 140 项（含 A股/美股市值门槛回归）
+python -m unittest discover -s tests -v  # 全量 309 项（含市值门槛、按钮状态机、Agent 边界、CLI 调试、日线诊断回归）
+python -m tests.test_agent_foundation      # 字段工具/报告/LLM 容错/技术面与风险分支
+python -m tests.test_agent_decision_edges  # 决策链评分/证据/交易/风控边界与上下文注入
+python -m tests.test_main_cli             # CLI 参数/离线三场景/上下文注入/扫描联动（27 项）
+python -m tests.test_history_diagnostics  # 日线失败原因可追溯（数据源/容错/结果/CLI/GUI，27 项）
+python -m tests.test_gui_analyze_button  # 深度研究按钮：样式/状态/防重复（Qt offscreen）
 python -m tests.test_us_market           # 美股板块扫描与数据层测试
 python -m tests.test_us_market_cap       # 美股市值门槛专项（字段/策略/缓存/GUI）
 python -m tests.test_a_share_market_cap  # A 股市值门槛专项（配置/工作流/双市场隔离）
@@ -279,7 +348,89 @@ python -m tests.test_gui_market_switch   # 市场下拉框切换测试（Qt offs
 
 > 美股财务/估值/资金等接口的可用字段随 Futu SDK 版本与账号权限变化；缺失维度会在四层研究中标记「数据不足」，不会用 0 或猜测值填充。本功能仅供研究参考，不构成投资建议。
 
-## 十、调试日志
+## 十一、CLI 四层研究调试（main.py）
+
+日常修改 Agent 规则、排查证据链时，不用打开 GUI、也不用先做一次全市场扫描：`main.py`
+直接调用 `TradingAgentsOrchestrator`，一条命令跑完「第一层分析师 → 第二层多空辩论 →
+第三层 Trader → 第四层风险管理」，并打印分层摘要、导出完整结构化结果。
+
+### 三个入口
+
+| 命令 | 用途 | 需要 OpenD |
+| --- | --- | --- |
+| `python main.py` | 与旧版完全一致：A 股全市场扫描 | 是 |
+| `python main.py scan --market US` | 美股全市场板块扫描 | 是 |
+| `python main.py scan --analyze SH.600519` | 扫描后带**真实** `market_summary` / `top_sectors` 上下文对指定代码跑四层 | 是 |
+| `python main.py analyze --code SH.600519` | 直接对单只股票跑四层（跳过全市场扫描） | 是 |
+| `python main.py analyze --code SH.600519 --offline` | 离线确定性样本，用于回归和断点调试 | 否 |
+
+无子命令时按 `scan` 处理，所以 `python main.py --market US` 等价于 `python main.py scan --market US`。完整参数见 `python main.py --help` / `python main.py analyze --help`。
+
+```bash
+python main.py analyze --code US.AAPL --market US --offline --fixture bear --detail
+python main.py analyze --code SH.600519 --offline --macro-json @output/macro.json
+python main.py analyze --code SH.600519 --json-out output/result.json --log-level DEBUG
+```
+
+### 关键参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--offline` / `--fixture {bull,bear,sparse}` | 使用 `ashare_hunter/data/debug_fixture.py` 的合成样本；不连 OpenD、自动关闭 LLM |
+| `--market {A,US}` | `analyze` 与 `scan` 均默认 A 股；分析美股代码时显式指定 `--market US` |
+| `--market-json` / `--sectors-json` / `--sector NAME` | 手工注入市场概览与强势板块上下文；`--sector` 可重复 |
+| `--macro-json` | 注入利率 / AI 行业景气度；支持内联 JSON、文件路径、`@文件路径` |
+| `--detail` | 打印分析师结论、多空论点、四层证据检查表、决策依据与风控检查项 |
+| `--json-out PATH` | 导出完整结果；传目录时自动命名；未指定则自动留档到 `output/trading_agents/` |
+| `--no-save` / `--no-llm` | 关闭自动留档 / 本次临时关闭 LLM 总结（结束后恢复配置） |
+| `--log-level DEBUG` / `--log-file PATH` | 覆盖日志级别与滚动日志文件，详见下一章 |
+| `scan --min-cap N` | 最低总市值，单位亿元（A 股）/ 亿美元（美股），`0` 关闭 |
+
+`--fixture` 三场景：`bull` 偏多（裁决偏多、买入）、`bear` 偏空（裁决偏空、卖出）、
+`sparse` 所有数据源返回 `available=False`，用来验证「数据不足」不编造证据、不强行裁决的降级路径。
+
+### 输出与退出码
+
+- 控制台按四层分段打印：最终建议（动作 / 裁决 / 仓位 / 风险 / 审核）、分析师评分、
+  证据覆盖 `可判定 N/M` 与四层分层覆盖、尚缺数据、Trader 关注区间与失效条件、风控前置条件。
+- **日线数据诊断**：日线不可用时打印具体原因（接口异常原文 / 空表 / 缺 `close` 列 / 有效收盘不足 20 根）、
+  返回行数与有效收盘根数，以及影响范围（趋势、动量 Agent 与技术面证据将标记「数据不足」）；
+  `--detail` 在日线正常时也打印可用状态。诊断同时写入 `data_sources.history`，
+  GUI「概览」和「第一层 · 分析师」页会同步显示，排查方向见下一章。
+- 完整结果（含 `trading_agents.analysts / research / trading / risk / final_recommendation`、
+  原始 `data_sources`、`overall` 等）以 UTF-8 JSON 落盘，便于 diff、复现与脚本消费。
+- 退出码：`0` 成功、`2` 参数错误、`1` 运行异常（完整堆栈打印到控制台并写入日志）。
+
+### 宏观上下文不能编造
+
+宏观层没有自动数据源，默认标记「数据不足」。只有显式录入且**带来源与日期**时才生成证据，
+并标注「外部录入 / 弱」：
+
+```json
+{
+  "rate": {"judgement": "有利", "source": "央行公告", "as_of": "2026-11-19"},
+  "industry": {"judgement": "提升", "source": "行业协会月报", "as_of": "2026-11-19"}
+}
+```
+
+判定词可用：有利 / 改善 / 提升 / 上行 / 宽松、不利 / 恶化 / 回落 / 下行 / 收紧、中性 / 持平。
+`--market-json` / `--sectors-json` 同理：注入什么就用什么，CLI 不会替你补市场结论。
+
+### 与 GUI 的差异
+
+- CLI 直接指定代码，因此**没有** GUI 那道「低于市值门槛拒绝深度研究」的二次防护；
+  `scan --analyze` 从候选表取股票时天然已经过快照阶段过滤。
+- `scan --analyze` 会为四层研究另建一次数据连接；GUI 用后台线程，CLI 同步执行。
+- `--offline` 样本只用于调试链路，不冒充真实行情；在线模式仍需启动 Futu OpenD 并具备对应行情权限。
+
+### 离线验证
+
+```bash
+python -m unittest tests.test_main_cli -v              # CLI 调试入口 27 项（不连 OpenD、不发 LLM 请求）
+python -m unittest tests.test_history_diagnostics -v   # 日线诊断 27 项（含数据源失败日志与 GUI/CLI 文案）
+```
+
+## 十二、调试日志
 
 程序内置统一日志：**控制台 + 滚动文件 + GUI「运行日志」面板**三路输出。文件记录最全，界面只看关键进展。
 
@@ -296,6 +447,10 @@ LOG_LEVEL=DEBUG
 ### 能排查什么
 
 - **每次 Futu 接口调用**：方法名、参数摘要、耗时、返回规模；失败时完整保留服务端错误（例如「暂不提供美股 OTC 市场行情 2578256D」）。400 个代码的批次只记录数量与首尾，不会把全表刷进日志。
+- **日线不可用的根因**：`request_history_kline` 走独立链路（返回三元组，不经 `_call`），现已单独记录
+  `ret` 与服务端错误原文、参数与耗时；返回空表、有效收盘不足 20 根、列名随 SDK 变化时分别打
+  WARNING / ERROR（含实际列名）。`_safe_fetch` 降级也带异常类型与消息，失败原因不再被静默吞掉。
+  排查顺序：OpenD 连接 → 历史 K 线行情权限 → 标的退市/停牌或次新股 → 接口限频 → SDK 字段变化。
 - **快照容错过程**：批次数、二分隔离坏标的、被跳过的无权限代码、OTC 源头过滤按交易所分类统计。
 - **板块缓存**：板块列表数量、缓存命中、本次刷新数量与限频、聚合结果规模；旧库 `market` 列迁移也会记录。
 - **阶段耗时**：快照 → 市场概览 → 板块聚合/排名 → 板块选股 → 技术面 → 研究解读，以及 TradingAgents 四层每一层的结论与耗时。
@@ -325,7 +480,7 @@ LOG_BACKUP_COUNT=3
 python -m unittest tests.test_logging -v   # 日志体系 13 项
 ```
 
-## 十一、打包为 Windows 可执行程序
+## 十三、打包为 Windows 可执行程序
 
 项目提供一键打包脚本，基于 PyInstaller 将 PySide6 GUI 打包为 exe。
 
